@@ -1,0 +1,35 @@
+# Dual License
+
+This software is available under two different licenses:
+
+1. **GNU Affero General Public License v3.0 (AGPL-3.0)** - See [LICENSE-AGPL](LICENSE-AGPL)
+2. **Commercial License** - See [LICENSE-COMMERCIAL](LICENSE-COMMERCIAL)
+
+## Open Source License (AGPL-3.0)
+
+For open source projects, this software is licensed under the GNU Affero General Public License v3.0.
+
+Under the AGPL, you may use, modify, and distribute this software, but:
+- You must release your complete source code under the AGPL
+- If you run a modified version on a server and let users interact with it, you must make the source code available to those users
+- You must include the original copyright notice and license
+
+## Commercial License
+
+For companies and projects that:
+- Want to use this software in closed-source/proprietary applications
+- Cannot or do not want to comply with the AGPL requirements
+- Need additional support, features, or customization
+
+A commercial license is available from Astoria Systems GmbH.
+
+### Contact for Commercial Licensing
+
+**Astoria Systems GmbH**
+Email: license@astoria.systems
+Website: https://astoria.systems
+
+---
+
+Copyright (c) 2025 Astoria Systems GmbH
+Author: Mergim Mavraj

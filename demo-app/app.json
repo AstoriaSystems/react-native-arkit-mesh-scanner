@@ -1,0 +1,44 @@
+{
+  "expo": {
+    "name": "Mesh Scanner Demo",
+    "slug": "mesh-scanner-demo",
+    "version": "1.1.4",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": false,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#1C1C1E"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.meshscanner.demo",
+      "buildNumber": "1",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Diese App benötigt Kamerazugriff für AR Mesh Scanning",
+        "UIRequiredDeviceCapabilities": [
+          "arkit",
+          "lidar"
+        ]
+      },
+      "appleTeamId": "JN7TP8NKW7"
+    },
+    "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "deploymentTarget": "15.1"
+          }
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "your-project-id"
+      }
+    }
+  }
+}
