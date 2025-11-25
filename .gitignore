@@ -1,0 +1,67 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+lib/
+dist/
+
+# Xcode
+ios/build/
+*.xcuserstate
+*.xcworkspacedata
+xcuserdata/
+DerivedData/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.hmap
+*.ipa
+*.xcuserstate
+project.xcworkspace
+
+# CocoaPods
+ios/Pods/
+Pods/
+*.xcworkspace
+
+# TypeScript
+*.tsbuildinfo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Demo app build artifacts
+demo-app/node_modules/
+demo-app/ios/Pods/
+demo-app/ios/build/
+demo-app/.expo/
+
+# Example
+example/node_modules/
+example/ios/Pods/
+example/ios/build/
+example/android/build/
+example/android/.gradle/
+
+# Expo
+.expo/
+
+# Temporary files
+*.tmp
+*.temp
