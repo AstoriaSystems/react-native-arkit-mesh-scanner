@@ -62,23 +62,29 @@ public class ARKitMeshScannerView: UIView {
     private var lastUpdateTime: Date = Date()
     private let updateInterval: TimeInterval = 0.15
 
+    // Thread safety - use NSLock for all mesh data access
+    private let meshLock = NSLock()
+
     // Throttling for distance culling
     private var lastDistanceCheckTime: Date = Date()
     private let distanceCheckInterval: TimeInterval = 0.5 // Check distance 2x per second
 
-    // Throttling for mesh updates per anchor
+    // Throttling for mesh updates per anchor - increased interval for better performance
     private var lastMeshUpdateTimes: [UUID: Date] = [:]
-    private let minMeshUpdateInterval: TimeInterval = 0.5 // Don't update same anchor more than 2x/second
+    private let minMeshUpdateInterval: TimeInterval = 1.0 // Don't update same anchor more than 1x/second
 
-    // Frame capture
+    // Frame capture - reduced frequency for better performance
     private var capturedFrames: [CapturedFrame] = []
     private var lastCaptureTime: Date = Date()
-    private let captureInterval: TimeInterval = 0.5
-    private let maxFrames: Int = 50
+    private let captureInterval: TimeInterval = 2.0 // Capture frames every 2 seconds
+    private let maxFrames: Int = 25 // Reduced from 50
 
     // Controllers
     private let previewController = PreviewController()
     private let meshExporter = MeshExporter()
+
+    // Serial queue for mesh processing to avoid race conditions
+    private let meshProcessingQueue = DispatchQueue(label: "com.arkitmeshscanner.meshprocessing", qos: .userInitiated)
 
     // MARK: - Configuration Properties
 
@@ -98,7 +104,7 @@ public class ARKitMeshScannerView: UIView {
         didSet { updateOcclusionSettings() }
     }
 
-    @objc public var maxRenderDistance: Float = 5.0 // meters
+    @objc public var maxRenderDistance: Float = 1000.0 // meters - effectively disabled by default
 
     private var currentCameraTransform: simd_float4x4?
 
@@ -253,6 +259,9 @@ public class ARKitMeshScannerView: UIView {
     }
 
     @objc public func getMeshStats() -> [String: Any] {
+        meshLock.lock()
+        defer { meshLock.unlock() }
+
         var totalVertices = 0
         var totalFaces = 0
 
@@ -272,6 +281,9 @@ public class ARKitMeshScannerView: UIView {
     // MARK: - Private Methods
 
     private func clearMeshEntities() {
+        meshLock.lock()
+        defer { meshLock.unlock() }
+
         for (_, anchorEntity) in meshAnchorEntities {
             arView.scene.removeAnchor(anchorEntity)
         }
@@ -280,12 +292,18 @@ public class ARKitMeshScannerView: UIView {
     }
 
     private func updateMeshVisibility() {
+        meshLock.lock()
+        defer { meshLock.unlock() }
+
         for (_, entity) in meshModelEntities {
             entity.isEnabled = showMesh
         }
     }
 
     private func updateMeshMaterial() {
+        meshLock.lock()
+        defer { meshLock.unlock() }
+
         let color = UIColor(hex: meshColorHex) ?? UIColor(red: 0, green: 0.7, blue: 1, alpha: 1)
         for (_, entity) in meshModelEntities {
             applyMaterial(to: entity, color: color)
@@ -332,64 +350,194 @@ public class ARKitMeshScannerView: UIView {
         performMeshEntityUpdate(for: anchor)
     }
 
-    /// Direct mesh entity update on main thread
-    private func performMeshEntityUpdate(for anchor: ARMeshAnchor) {
+    /// Thread-safe structure to hold copied mesh geometry data
+    private struct MeshGeometrySnapshot {
+        let positions: [SIMD3<Float>]
+        let indices: [UInt32]
+        let transform: simd_float4x4
+    }
+
+    /// Safely extract mesh geometry data from ARMeshAnchor
+    /// Creates a complete copy of the geometry data to avoid race conditions with ARKit's buffers
+    /// Returns nil if the data cannot be safely copied
+    private func extractMeshGeometry(from anchor: ARMeshAnchor) -> MeshGeometrySnapshot? {
+        // Capture all values we need from the anchor immediately
+        // ARKit can update the anchor at any time, so we snapshot everything first
         let geometry = anchor.geometry
-        var descriptor = MeshDescriptor()
+        let transform = anchor.transform
 
-        // Get vertices directly from ARKit
-        let vertices = geometry.vertices
-        var positions: [SIMD3<Float>] = []
-        positions.reserveCapacity(vertices.count)
-        let vertexBuffer = vertices.buffer.contents()
+        // Get metadata before accessing buffers
+        let vertexCount = geometry.vertices.count
+        let faceCount = geometry.faces.count
 
-        for i in 0..<vertices.count {
-            let vertexPointer = vertexBuffer.advanced(by: vertices.offset + vertices.stride * i)
-            let vertex = vertexPointer.assumingMemoryBound(to: SIMD3<Float>.self).pointee
-            positions.append(vertex)
+        guard vertexCount > 0, faceCount > 0 else { return nil }
+
+        // Capture buffer metadata
+        let vertexStride = geometry.vertices.stride
+        let vertexOffset = geometry.vertices.offset
+        let vertexBufferLength = geometry.vertices.buffer.length
+
+        let indexCountPerPrimitive = geometry.faces.indexCountPerPrimitive
+        let bytesPerIndex = geometry.faces.bytesPerIndex
+        let faceBufferLength = geometry.faces.buffer.length
+
+        // Validate buffer sizes to prevent out-of-bounds access
+        let requiredVertexBytes = vertexOffset + (vertexStride * vertexCount)
+        let requiredFaceBytes = bytesPerIndex * faceCount * indexCountPerPrimitive
+
+        guard requiredVertexBytes <= vertexBufferLength,
+              requiredFaceBytes <= faceBufferLength else {
+            print("ARKitMeshScanner: Buffer size mismatch, skipping anchor")
+            return nil
         }
-        descriptor.positions = MeshBuffer(positions)
 
-        // Get faces directly
-        let faces = geometry.faces
-        var indices: [UInt32] = []
-        indices.reserveCapacity(faces.count * faces.indexCountPerPrimitive)
-        let faceBuffer = faces.buffer.contents()
+        // Create safe copies of the raw buffer data
+        // This is the critical section - copy raw bytes as fast as possible
+        var vertexData = Data(count: vertexBufferLength)
+        var faceData = Data(count: faceBufferLength)
 
-        for i in 0..<faces.count {
-            for j in 0..<faces.indexCountPerPrimitive {
-                let indexPointer = faceBuffer.advanced(by: faces.bytesPerIndex * (i * faces.indexCountPerPrimitive + j))
-                if faces.bytesPerIndex == 4 {
-                    indices.append(indexPointer.assumingMemoryBound(to: UInt32.self).pointee)
-                } else {
-                    indices.append(UInt32(indexPointer.assumingMemoryBound(to: UInt16.self).pointee))
+        // Copy vertex buffer
+        let vertexBuffer = geometry.vertices.buffer
+        vertexData.withUnsafeMutableBytes { destPtr in
+            guard let dest = destPtr.baseAddress else { return }
+            memcpy(dest, vertexBuffer.contents(), vertexBufferLength)
+        }
+
+        // Copy face buffer
+        let faceBuffer = geometry.faces.buffer
+        faceData.withUnsafeMutableBytes { destPtr in
+            guard let dest = destPtr.baseAddress else { return }
+            memcpy(dest, faceBuffer.contents(), faceBufferLength)
+        }
+
+        // Now process the copied data safely - ARKit can no longer affect us
+        var positions: [SIMD3<Float>] = []
+        positions.reserveCapacity(vertexCount)
+
+        vertexData.withUnsafeBytes { rawPtr in
+            guard let basePtr = rawPtr.baseAddress else { return }
+
+            for i in 0..<vertexCount {
+                let offset = vertexOffset + vertexStride * i
+
+                // Bounds check
+                guard offset + MemoryLayout<SIMD3<Float>>.size <= vertexBufferLength else {
+                    continue
+                }
+
+                let vertexPtr = basePtr.advanced(by: offset)
+                let vertex = vertexPtr.assumingMemoryBound(to: SIMD3<Float>.self).pointee
+
+                // Validate vertex data - skip NaN or infinite values
+                if vertex.x.isFinite && vertex.y.isFinite && vertex.z.isFinite {
+                    positions.append(vertex)
                 }
             }
         }
-        descriptor.primitives = .triangles(indices)
 
-        do {
-            let meshResource = try MeshResource.generate(from: [descriptor])
-            let color = UIColor(hex: meshColorHex) ?? UIColor(red: 0, green: 0.7, blue: 1, alpha: 1)
+        guard positions.count >= 3 else { return nil }
 
-            if let existingModel = meshModelEntities[anchor.identifier] {
-                existingModel.model?.mesh = meshResource
-                existingModel.transform = Transform(matrix: anchor.transform)
-            } else {
-                var material = UnlitMaterial(color: color.withAlphaComponent(0.9))
-                material.blending = .transparent(opacity: 0.9)
-                let modelEntity = ModelEntity(mesh: meshResource, materials: [material])
-                modelEntity.transform = Transform(matrix: anchor.transform)
+        // Process face indices
+        var indices: [UInt32] = []
+        indices.reserveCapacity(faceCount * indexCountPerPrimitive)
+        let maxValidIndex = UInt32(positions.count - 1)
 
-                let anchorEntity = AnchorEntity(world: .zero)
-                anchorEntity.addChild(modelEntity)
-                arView.scene.addAnchor(anchorEntity)
+        faceData.withUnsafeBytes { rawPtr in
+            guard let basePtr = rawPtr.baseAddress else { return }
 
-                meshAnchorEntities[anchor.identifier] = anchorEntity
-                meshModelEntities[anchor.identifier] = modelEntity
+            for i in 0..<faceCount {
+                var faceIndices: [UInt32] = []
+                faceIndices.reserveCapacity(indexCountPerPrimitive)
+                var validFace = true
+
+                for j in 0..<indexCountPerPrimitive {
+                    let offset = bytesPerIndex * (i * indexCountPerPrimitive + j)
+
+                    // Bounds check
+                    guard offset + bytesPerIndex <= faceBufferLength else {
+                        validFace = false
+                        break
+                    }
+
+                    let indexPtr = basePtr.advanced(by: offset)
+                    let index: UInt32
+
+                    if bytesPerIndex == 4 {
+                        index = indexPtr.assumingMemoryBound(to: UInt32.self).pointee
+                    } else {
+                        index = UInt32(indexPtr.assumingMemoryBound(to: UInt16.self).pointee)
+                    }
+
+                    // Validate index is within bounds of our position array
+                    if index > maxValidIndex {
+                        validFace = false
+                        break
+                    }
+                    faceIndices.append(index)
+                }
+
+                if validFace {
+                    indices.append(contentsOf: faceIndices)
+                }
             }
-        } catch {
-            print("Failed to create mesh: \(error)")
+        }
+
+        guard indices.count >= 3 else { return nil }
+
+        return MeshGeometrySnapshot(positions: positions, indices: indices, transform: transform)
+    }
+
+    /// Direct mesh entity update on main thread
+    private func performMeshEntityUpdate(for anchor: ARMeshAnchor) {
+        let anchorId = anchor.identifier
+
+        // Extract geometry data safely on background queue to avoid blocking main thread
+        // This creates a complete copy of the buffer data
+        meshProcessingQueue.async { [weak self] in
+            guard let self = self else { return }
+
+            // Extract geometry data safely - this copies the data immediately
+            guard let snapshot = self.extractMeshGeometry(from: anchor) else {
+                return
+            }
+
+            // Create mesh descriptor from the safely copied data
+            var descriptor = MeshDescriptor()
+            descriptor.positions = MeshBuffer(snapshot.positions)
+            descriptor.primitives = .triangles(snapshot.indices)
+
+            do {
+                let meshResource = try MeshResource.generate(from: [descriptor])
+
+                // Update UI on main thread
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+
+                    let color = UIColor(hex: self.meshColorHex) ?? UIColor(red: 0, green: 0.7, blue: 1, alpha: 1)
+
+                    self.meshLock.lock()
+                    defer { self.meshLock.unlock() }
+
+                    if let existingModel = self.meshModelEntities[anchorId] {
+                        existingModel.model?.mesh = meshResource
+                        existingModel.transform = Transform(matrix: snapshot.transform)
+                    } else {
+                        var material = UnlitMaterial(color: color.withAlphaComponent(0.9))
+                        material.blending = .transparent(opacity: 0.9)
+                        let modelEntity = ModelEntity(mesh: meshResource, materials: [material])
+                        modelEntity.transform = Transform(matrix: snapshot.transform)
+
+                        let anchorEntity = AnchorEntity(world: .zero)
+                        anchorEntity.addChild(modelEntity)
+                        self.arView.scene.addAnchor(anchorEntity)
+
+                        self.meshAnchorEntities[anchorId] = anchorEntity
+                        self.meshModelEntities[anchorId] = modelEntity
+                    }
+                }
+            } catch {
+                print("ARKitMeshScanner: Failed to create mesh: \(error)")
+            }
         }
     }
 }
@@ -419,15 +567,24 @@ extension ARKitMeshScannerView: ARSessionDelegate {
     }
 
     private func updateMeshVisibilityByDistance() {
-        guard let cameraTransform = currentCameraTransform else { return }
+        // Distance-based culling is now disabled by default for better user experience
+        // Users reported confusion when mesh was not fully visible during scanning
+        // If maxRenderDistance is set to a very large value (>100), skip distance checks entirely
+        guard maxRenderDistance < 100, let cameraTransform = currentCameraTransform else { return }
+
         let cameraPosition = SIMD3<Float>(
             cameraTransform.columns.3.x,
             cameraTransform.columns.3.y,
             cameraTransform.columns.3.z
         )
 
-        for (uuid, anchor) in meshAnchors {
-            guard let modelEntity = meshModelEntities[uuid] else { continue }
+        meshLock.lock()
+        let anchorsSnapshot = meshAnchors
+        let entitiesSnapshot = meshModelEntities
+        meshLock.unlock()
+
+        for (uuid, anchor) in anchorsSnapshot {
+            guard let modelEntity = entitiesSnapshot[uuid] else { continue }
 
             let anchorPosition = SIMD3<Float>(
                 anchor.transform.columns.3.x,
@@ -518,7 +675,10 @@ extension ARKitMeshScannerView: ARSessionDelegate {
 
         for anchor in anchors {
             if let meshAnchor = anchor as? ARMeshAnchor {
+                meshLock.lock()
                 meshAnchors[meshAnchor.identifier] = meshAnchor
+                meshLock.unlock()
+
                 // Create new meshes immediately
                 performMeshEntityUpdate(for: meshAnchor)
             }
@@ -531,7 +691,10 @@ extension ARKitMeshScannerView: ARSessionDelegate {
 
         for anchor in anchors {
             if let meshAnchor = anchor as? ARMeshAnchor {
+                meshLock.lock()
                 meshAnchors[meshAnchor.identifier] = meshAnchor
+                meshLock.unlock()
+
                 updateMeshEntity(for: meshAnchor)
             }
         }
@@ -539,6 +702,9 @@ extension ARKitMeshScannerView: ARSessionDelegate {
     }
 
     public func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
+        meshLock.lock()
+        defer { meshLock.unlock() }
+
         for anchor in anchors {
             if let meshAnchor = anchor as? ARMeshAnchor {
                 meshAnchors.removeValue(forKey: meshAnchor.identifier)
