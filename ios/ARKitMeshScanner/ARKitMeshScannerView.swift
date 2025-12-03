@@ -69,19 +69,20 @@ public class ARKitMeshScannerView: UIView {
     private var lastDistanceCheckTime: Date = Date()
     private let distanceCheckInterval: TimeInterval = 1.0 // Check distance 1x per second (was 0.5)
 
-    // Throttling for mesh updates per anchor - aggressive throttling for huge scans
+    // Throttling for mesh updates per anchor
+    // Note: This only affects RE-UPDATES of existing anchors, not initial creation
     private var lastMeshUpdateTimes: [UUID: Date] = [:]
-    private let minMeshUpdateInterval: TimeInterval = 2.0 // Don't update same anchor more than 1x every 2 seconds
 
-    // Adaptive throttling - increases as mesh grows
+    // Adaptive throttling - fast for new anchors, slower for updates as mesh grows
     private var totalAnchorCount: Int = 0
     private var adaptiveUpdateInterval: TimeInterval {
         // Scale throttling based on mesh complexity
-        // < 50 anchors: 2s, 50-100: 3s, 100-200: 4s, 200+: 5s
-        if totalAnchorCount < 50 { return 2.0 }
-        if totalAnchorCount < 100 { return 3.0 }
-        if totalAnchorCount < 200 { return 4.0 }
-        return 5.0
+        // Only affects updates to EXISTING anchors - new anchors always render immediately
+        // < 30 anchors: 0.5s, 30-80: 1s, 80-150: 2s, 150+: 3s
+        if totalAnchorCount < 30 { return 0.5 }
+        if totalAnchorCount < 80 { return 1.0 }
+        if totalAnchorCount < 150 { return 2.0 }
+        return 3.0
     }
 
     // Frame capture - minimal for performance
@@ -92,11 +93,11 @@ public class ARKitMeshScannerView: UIView {
 
     // Performance tracking
     private var pendingMeshUpdates: Int = 0
-    private let maxPendingUpdates: Int = 3 // Don't queue more than 3 mesh updates at once
+    private let maxPendingUpdates: Int = 5 // Allow 5 concurrent mesh updates for fast initial display
 
     // Real-time rendering limits
-    private let maxVerticesPerAnchor: Int = 10000 // Skip anchors with too many vertices for real-time
-    private var skipLargeAnchors: Bool = false // Enabled when mesh gets huge
+    private let maxVerticesPerAnchor: Int = 15000 // Skip very large anchors in real-time
+    private var skipLargeAnchors: Bool = false // Enabled when mesh gets huge (>200 anchors)
 
     // Controllers
     private let previewController = PreviewController()
@@ -381,32 +382,42 @@ public class ARKitMeshScannerView: UIView {
     }
 
     /// Update mesh entity with adaptive throttling based on mesh complexity
-    private func updateMeshEntity(for anchor: ARMeshAnchor) {
+    /// New anchors are always rendered immediately, only re-updates are throttled
+    private func updateMeshEntity(for anchor: ARMeshAnchor, isNewAnchor: Bool = false) {
         guard showMesh else { return }
 
         let anchorId = anchor.identifier
         let now = Date()
 
+        // SAFETY: Read ARKit buffer data BEFORE acquiring lock to avoid holding lock during ARKit access
+        // This is safe because we're on the main thread in ARSessionDelegate callback
+        let vertexCount = anchor.geometry.vertices.count
+
         meshLock.lock()
         // Update anchor count for adaptive throttling
         totalAnchorCount = meshAnchors.count
 
-        // Check pending updates - skip if too many in flight
-        if pendingMeshUpdates >= maxPendingUpdates {
+        // Check pending updates - skip if too many in flight (but allow more for new anchors)
+        let effectiveMaxPending = isNewAnchor ? maxPendingUpdates + 2 : maxPendingUpdates
+        if pendingMeshUpdates >= effectiveMaxPending {
             meshLock.unlock()
             return
         }
 
-        // Adaptive throttle based on mesh size
-        let currentInterval = adaptiveUpdateInterval
-        if let lastUpdate = lastMeshUpdateTimes[anchorId],
-           now.timeIntervalSince(lastUpdate) < currentInterval {
-            meshLock.unlock()
-            return
+        // Only throttle RE-UPDATES, not initial creation
+        // New anchors should appear immediately for responsive feedback
+        if !isNewAnchor {
+            let currentInterval = adaptiveUpdateInterval
+            if let lastUpdate = lastMeshUpdateTimes[anchorId],
+               now.timeIntervalSince(lastUpdate) < currentInterval {
+                meshLock.unlock()
+                return
+            }
         }
 
         // Quick vertex count check - skip very large anchors in real-time to maintain framerate
-        if skipLargeAnchors && anchor.geometry.vertices.count > maxVerticesPerAnchor {
+        // Only skip for updates, not initial creation (user should see something)
+        if skipLargeAnchors && !isNewAnchor && vertexCount > maxVerticesPerAnchor {
             meshLock.unlock()
             return
         }
@@ -581,8 +592,8 @@ public class ARKitMeshScannerView: UIView {
                     // Decrement pending counter
                     self.pendingMeshUpdates = max(0, self.pendingMeshUpdates - 1)
 
-                    // Enable skip for large anchors if mesh is getting huge (>150 anchors)
-                    if self.meshAnchors.count > 150 {
+                    // Enable skip for large anchors if mesh is getting huge (>200 anchors)
+                    if self.meshAnchors.count > 200 {
                         self.skipLargeAnchors = true
                     }
 
@@ -776,8 +787,8 @@ extension ARKitMeshScannerView: ARSessionDelegate {
                 meshAnchors[meshAnchor.identifier] = meshAnchor
                 meshLock.unlock()
 
-                // Create new meshes immediately
-                performMeshEntityUpdate(for: meshAnchor)
+                // Create new meshes immediately - no throttling for new anchors
+                updateMeshEntity(for: meshAnchor, isNewAnchor: true)
             }
         }
         throttledSendUpdate()
