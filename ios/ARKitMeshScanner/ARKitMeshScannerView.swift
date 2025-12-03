@@ -178,8 +178,12 @@ public class ARKitMeshScannerView: UIView {
         }
 
         clearMeshEntities()
+
+        meshLock.lock()
         meshAnchors.removeAll()
         capturedFrames.removeAll()
+        lastMeshUpdateTimes.removeAll()
+        meshLock.unlock()
 
         let configuration = ARWorldTrackingConfiguration()
         configuration.sceneReconstruction = .meshWithClassification
@@ -206,19 +210,25 @@ public class ARKitMeshScannerView: UIView {
     }
 
     @objc public func enterPreviewMode() {
-        guard !meshAnchors.isEmpty else { return }
+        meshLock.lock()
+        let anchorsSnapshot = meshAnchors
+        let framesSnapshot = capturedFrames
+        let entitiesSnapshot = meshAnchorEntities
+        meshLock.unlock()
+
+        guard !anchorsSnapshot.isEmpty else { return }
 
         isScanning = false
 
         // Hide AR mesh entities
-        for (_, anchorEntity) in meshAnchorEntities {
+        for (_, anchorEntity) in entitiesSnapshot {
             anchorEntity.isEnabled = false
         }
 
         previewController.enterPreviewMode(
             arView: arView,
-            meshAnchors: meshAnchors,
-            capturedFrames: capturedFrames,
+            meshAnchors: anchorsSnapshot,
+            capturedFrames: framesSnapshot,
             meshColor: meshColorHex
         )
     }
@@ -226,8 +236,12 @@ public class ARKitMeshScannerView: UIView {
     @objc public func exitPreviewMode() {
         previewController.exitPreviewMode()
 
+        meshLock.lock()
+        let entitiesSnapshot = meshAnchorEntities
+        meshLock.unlock()
+
         // Show AR mesh entities again
-        for (_, anchorEntity) in meshAnchorEntities {
+        for (_, anchorEntity) in entitiesSnapshot {
             anchorEntity.isEnabled = true
         }
 
@@ -238,16 +252,28 @@ public class ARKitMeshScannerView: UIView {
         if previewController.isActive {
             exitPreviewMode()
         }
+
+        meshLock.lock()
         meshAnchors.removeAll()
+        capturedFrames.removeAll()
+        lastMeshUpdateTimes.removeAll()
+        meshLock.unlock()
+
         clearMeshEntities()
         sendMeshUpdate()
     }
 
     @objc public func exportMesh(filename: String, completion: @escaping (String?, Int, Int, String?) -> Void) {
+        // Take snapshots under lock
+        meshLock.lock()
+        let anchorsSnapshot = meshAnchors
+        let framesSnapshot = capturedFrames
+        meshLock.unlock()
+
         meshExporter.exportMesh(
-            meshAnchors: meshAnchors,
+            meshAnchors: anchorsSnapshot,
             filename: filename,
-            capturedFrames: capturedFrames
+            capturedFrames: framesSnapshot
         ) { result in
             switch result {
             case .success(let exportResult):
@@ -341,11 +367,14 @@ public class ARKitMeshScannerView: UIView {
         let now = Date()
 
         // Throttle updates per anchor - skip if updated recently
+        meshLock.lock()
         if let lastUpdate = lastMeshUpdateTimes[anchorId],
            now.timeIntervalSince(lastUpdate) < minMeshUpdateInterval {
+            meshLock.unlock()
             return
         }
         lastMeshUpdateTimes[anchorId] = now
+        meshLock.unlock()
 
         performMeshEntityUpdate(for: anchor)
     }
@@ -487,19 +516,21 @@ public class ARKitMeshScannerView: UIView {
         return MeshGeometrySnapshot(positions: positions, indices: indices, transform: transform)
     }
 
-    /// Direct mesh entity update on main thread
+    /// Thread-safe mesh entity update
+    /// CRITICAL: Must extract geometry data IMMEDIATELY on the calling thread before ARKit can invalidate the buffer
     private func performMeshEntityUpdate(for anchor: ARMeshAnchor) {
         let anchorId = anchor.identifier
 
-        // Extract geometry data safely on background queue to avoid blocking main thread
-        // This creates a complete copy of the buffer data
+        // CRITICAL: Extract geometry data IMMEDIATELY on current thread (main thread from ARSession delegate)
+        // ARKit can invalidate the anchor's buffer at any time, so we must copy it NOW
+        // Do NOT pass the anchor to a background queue - the buffer may be invalid by then
+        guard let snapshot = extractMeshGeometry(from: anchor) else {
+            return
+        }
+
+        // Now process the safely copied data on background queue for performance
         meshProcessingQueue.async { [weak self] in
             guard let self = self else { return }
-
-            // Extract geometry data safely - this copies the data immediately
-            guard let snapshot = self.extractMeshGeometry(from: anchor) else {
-                return
-            }
 
             // Create mesh descriptor from the safely copied data
             var descriptor = MeshDescriptor()
@@ -609,7 +640,12 @@ extension ARKitMeshScannerView: ARSessionDelegate {
         default:
             return
         }
-        guard capturedFrames.count < maxFrames else { return }
+
+        meshLock.lock()
+        let currentCount = capturedFrames.count
+        meshLock.unlock()
+
+        guard currentCount < maxFrames else { return }
 
         if let copiedBuffer = copyPixelBuffer(frame.capturedImage) {
             let capturedFrame = CapturedFrame(
@@ -622,8 +658,13 @@ extension ARKitMeshScannerView: ARSessionDelegate {
                 ),
                 timestamp: frame.timestamp
             )
+
+            meshLock.lock()
             capturedFrames.append(capturedFrame)
-            print("Captured frame \(capturedFrames.count)/\(maxFrames)")
+            let newCount = capturedFrames.count
+            meshLock.unlock()
+
+            print("Captured frame \(newCount)/\(maxFrames)")
         }
     }
 
