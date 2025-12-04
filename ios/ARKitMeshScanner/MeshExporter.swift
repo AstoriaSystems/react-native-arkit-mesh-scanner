@@ -58,6 +58,24 @@ struct MeshExportResult {
 /// Handles exporting mesh data to OBJ format.
 final class MeshExporter {
 
+    // MARK: - Memory Monitoring
+
+    /// Returns current memory usage in MB for debugging
+    private func getMemoryUsageMB() -> UInt64 {
+        var taskInfo = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size)/4
+        let result = withUnsafeMutablePointer(to: &taskInfo) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: 1) {
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+
+        if result == KERN_SUCCESS {
+            return taskInfo.resident_size / 1_000_000
+        }
+        return 0
+    }
+
     // MARK: - Public Methods
 
     /// Exports mesh anchors to an OBJ file.
@@ -78,6 +96,10 @@ final class MeshExporter {
             completion(.failure(MeshExportError.noMeshData))
             return
         }
+
+        // Log memory usage before export for debugging crashes
+        let memoryMB = getMemoryUsageMB()
+        print("📊 Starting mesh export - Memory usage: \(memoryMB)MB, Anchors: \(meshAnchors.count)")
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
@@ -209,9 +231,13 @@ final class MeshExporter {
             }
         }
 
-        try objContent.write(to: objPath, atomically: true, encoding: .utf8)
+        do {
+            try objContent.write(to: objPath, atomically: true, encoding: .utf8)
+        } catch {
+            throw MeshExportError.writeFailed(error.localizedDescription)
+        }
 
-        print("Mesh exported to: \(objPath.path) (quality: \(quality.rawValue))")
+        print("✅ Mesh exported to: \(objPath.path) (quality: \(quality.rawValue))")
 
         return MeshExportResult(
             path: objPath.path,
@@ -225,11 +251,14 @@ final class MeshExporter {
 
 enum MeshExportError: LocalizedError {
     case noMeshData
+    case writeFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .noMeshData:
             return "No mesh data available for export"
+        case .writeFailed(let reason):
+            return "Failed to write mesh file: \(reason)"
         }
     }
 }

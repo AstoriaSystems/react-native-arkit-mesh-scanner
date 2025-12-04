@@ -410,7 +410,8 @@ public class ARKitMeshScannerView: UIView {
                 meshModelEntities[anchor.identifier] = modelEntity
             }
         } catch {
-            // Silently ignore mesh generation failures
+            // Log mesh generation failures for debugging
+            print("⚠️ Mesh generation failed for anchor \(anchor.identifier): \(error.localizedDescription)")
         }
     }
 }
