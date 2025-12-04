@@ -65,9 +65,9 @@ export interface ErrorEvent {
 
 export interface MemoryWarningEvent {
   nativeEvent: {
-    /** Warning level: 'warning' = approaching limit, 'saved' = chunk auto-saved, 'critical' = must stop */
-    level: 'warning' | 'saved' | 'critical';
-    /** Current memory usage in MB (for 'warning' level) */
+    /** Warning level: 'status' = regular update, 'warning' = approaching limit, 'saved' = chunk auto-saved, 'critical' = must stop */
+    level: 'status' | 'warning' | 'saved' | 'critical';
+    /** Current memory usage in MB */
     memoryMB?: number;
     /** Index of saved chunk (for 'saved' level) */
     chunkIndex?: number;

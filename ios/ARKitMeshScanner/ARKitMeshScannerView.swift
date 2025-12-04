@@ -385,7 +385,9 @@ public class ARKitMeshScannerView: UIView {
         guard isScanning, !isAutoSaving else { return }
 
         let memoryMB = getMemoryUsageMB()
-        let now = Date()
+
+        // Always emit current memory status for UI display
+        onMemoryWarning?(["level": "status", "memoryMB": memoryMB])
 
         if memoryMB >= memoryHardLimit {
             // Emergency stop - prevent crash
@@ -399,12 +401,9 @@ public class ARKitMeshScannerView: UIView {
             print("⚠️ Memory high (\(memoryMB)MB) - auto-saving chunk")
             autoSaveChunk()
         } else if memoryMB >= memoryWarningThreshold {
-            // Emit warning (throttled to once per 30 seconds)
-            if now.timeIntervalSince(lastMemoryWarningTime) >= 30.0 {
-                lastMemoryWarningTime = now
-                print("📊 Memory warning (\(memoryMB)MB)")
-                onMemoryWarning?(["level": "warning", "memoryMB": memoryMB])
-            }
+            // Emit warning
+            print("📊 Memory warning (\(memoryMB)MB)")
+            onMemoryWarning?(["level": "warning", "memoryMB": memoryMB])
         }
     }
 
