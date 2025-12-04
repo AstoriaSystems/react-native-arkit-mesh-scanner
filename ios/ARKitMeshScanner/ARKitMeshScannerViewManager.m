@@ -56,5 +56,6 @@ RCT_EXPORT_VIEW_PROPERTY(maxRenderDistance, float)
 RCT_EXPORT_VIEW_PROPERTY(onMeshUpdate, RCTDirectEventBlock)
 RCT_EXPORT_VIEW_PROPERTY(onScanComplete, RCTDirectEventBlock)
 RCT_EXPORT_VIEW_PROPERTY(onError, RCTDirectEventBlock)
+RCT_EXPORT_VIEW_PROPERTY(onMemoryWarning, RCTDirectEventBlock)
 
 @end

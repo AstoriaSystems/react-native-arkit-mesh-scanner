@@ -80,6 +80,15 @@ public class ARKitMeshScannerView: UIView {
     private let previewController = PreviewController()
     private let meshExporter = MeshExporter()
 
+    // Memory monitoring
+    private var savedMeshChunks: [String] = []
+    private var memoryCheckTimer: Timer?
+    private let memoryWarningThreshold: UInt64 = 2000  // MB - show warning
+    private let memorySaveThreshold: UInt64 = 2500     // MB - auto-save and clear
+    private let memoryHardLimit: UInt64 = 3000         // MB - force stop
+    private var isAutoSaving: Bool = false
+    private var lastMemoryWarningTime: Date = Date.distantPast
+
     // MARK: - Configuration Properties
 
     @objc public var showMesh: Bool = true {
@@ -107,6 +116,7 @@ public class ARKitMeshScannerView: UIView {
     @objc public var onMeshUpdate: RCTDirectEventBlock?
     @objc public var onScanComplete: RCTDirectEventBlock?
     @objc public var onError: RCTDirectEventBlock?
+    @objc public var onMemoryWarning: RCTDirectEventBlock?
 
     // MARK: - Initialization
 
@@ -174,6 +184,8 @@ public class ARKitMeshScannerView: UIView {
         clearMeshEntities()
         meshAnchors.removeAll()
         capturedFrames.removeAll()
+        savedMeshChunks.removeAll()
+        lastMemoryWarningTime = Date.distantPast
 
         let configuration = ARWorldTrackingConfiguration()
         configuration.sceneReconstruction = .meshWithClassification
@@ -191,11 +203,13 @@ public class ARKitMeshScannerView: UIView {
         arView.session.run(configuration, options: [.removeExistingAnchors])
         isScanning = true
 
+        startMemoryMonitoring()
         sendMeshUpdate()
     }
 
     @objc public func stopScanning() {
         isScanning = false
+        stopMemoryMonitoring()
         sendMeshUpdate()
     }
 
@@ -238,6 +252,12 @@ public class ARKitMeshScannerView: UIView {
     }
 
     @objc public func exportMesh(filename: String, completion: @escaping (String?, Int, Int, String?) -> Void) {
+        // If we have saved chunks, use merged export
+        if !savedMeshChunks.isEmpty {
+            exportMergedMesh(filename: filename, completion: completion)
+            return
+        }
+
         meshExporter.exportMesh(
             meshAnchors: meshAnchors,
             filename: filename,
@@ -250,6 +270,34 @@ public class ARKitMeshScannerView: UIView {
                 completion(nil, 0, 0, error.localizedDescription)
             }
         }
+    }
+
+    private func exportMergedMesh(filename: String, completion: @escaping (String?, Int, Int, String?) -> Void) {
+        print("📦 Exporting merged mesh from \(savedMeshChunks.count) chunks + current anchors...")
+
+        meshExporter.exportMergedMesh(
+            chunkPaths: savedMeshChunks,
+            currentAnchors: meshAnchors,
+            filename: filename,
+            capturedFrames: capturedFrames
+        ) { [weak self] result in
+            switch result {
+            case .success(let exportResult):
+                // Clean up chunk files after successful merge
+                self?.cleanupChunkFiles()
+                completion(exportResult.path, exportResult.vertexCount, exportResult.faceCount, nil)
+            case .failure(let error):
+                completion(nil, 0, 0, error.localizedDescription)
+            }
+        }
+    }
+
+    private func cleanupChunkFiles() {
+        for chunkPath in savedMeshChunks {
+            try? FileManager.default.removeItem(atPath: chunkPath)
+        }
+        savedMeshChunks.removeAll()
+        print("🧹 Cleaned up \(savedMeshChunks.count) chunk files")
     }
 
     @objc public func getMeshStats() -> [String: Any] {
@@ -305,6 +353,113 @@ public class ARKitMeshScannerView: UIView {
 
     private func sendError(_ message: String) {
         onError?(["message": message])
+    }
+
+    // MARK: - Memory Monitoring
+
+    private func getMemoryUsageMB() -> UInt64 {
+        var taskInfo = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size)/4
+        let result = withUnsafeMutablePointer(to: &taskInfo) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: 1) {
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        return result == KERN_SUCCESS ? taskInfo.resident_size / 1_000_000 : 0
+    }
+
+    private func startMemoryMonitoring() {
+        stopMemoryMonitoring()
+        memoryCheckTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.checkMemory()
+        }
+        print("📊 Started memory monitoring")
+    }
+
+    private func stopMemoryMonitoring() {
+        memoryCheckTimer?.invalidate()
+        memoryCheckTimer = nil
+    }
+
+    private func checkMemory() {
+        guard isScanning, !isAutoSaving else { return }
+
+        let memoryMB = getMemoryUsageMB()
+
+        // Always emit current memory status for UI display
+        onMemoryWarning?(["level": "status", "memoryMB": memoryMB])
+
+        if memoryMB >= memoryHardLimit {
+            // Emergency stop - prevent crash
+            print("🚨 Memory critical (\(memoryMB)MB) - force stopping scan")
+            isScanning = false
+            stopMemoryMonitoring()
+            onMemoryWarning?(["level": "critical", "memoryMB": memoryMB])
+            sendMeshUpdate()
+        } else if memoryMB >= memorySaveThreshold {
+            // Auto-save and clear to continue scanning
+            print("⚠️ Memory high (\(memoryMB)MB) - auto-saving chunk")
+            autoSaveChunk()
+        } else if memoryMB >= memoryWarningThreshold {
+            // Emit warning
+            print("📊 Memory warning (\(memoryMB)MB)")
+            onMemoryWarning?(["level": "warning", "memoryMB": memoryMB])
+        }
+    }
+
+    private func autoSaveChunk() {
+        guard !isAutoSaving else { return }
+        isAutoSaving = true
+
+        let chunkIndex = savedMeshChunks.count
+        let chunkName = "mesh_chunk_\(chunkIndex)_\(UUID().uuidString.prefix(8))"
+
+        print("💾 Auto-saving chunk \(chunkIndex)...")
+
+        meshExporter.exportMesh(
+            meshAnchors: meshAnchors,
+            filename: chunkName,
+            capturedFrames: []
+        ) { [weak self] result in
+            guard let self = self else { return }
+
+            switch result {
+            case .success(let exportResult):
+                self.savedMeshChunks.append(exportResult.path)
+                print("✅ Chunk \(chunkIndex) saved: \(exportResult.path)")
+
+                // Clear mesh data but keep scanning
+                self.clearMeshForContinuation()
+
+                // Notify React Native
+                self.onMemoryWarning?([
+                    "level": "saved",
+                    "chunkIndex": chunkIndex,
+                    "chunkPath": exportResult.path,
+                    "totalChunks": self.savedMeshChunks.count
+                ])
+
+            case .failure(let error):
+                print("❌ Failed to save chunk: \(error.localizedDescription)")
+                // If save fails, force stop to prevent crash
+                self.isScanning = false
+                self.stopMemoryMonitoring()
+                self.onMemoryWarning?(["level": "critical", "error": error.localizedDescription])
+            }
+
+            self.isAutoSaving = false
+        }
+    }
+
+    private func clearMeshForContinuation() {
+        // Clear mesh data but keep ARSession running
+        meshAnchors.removeAll()
+        clearMeshEntities()
+        lastMeshUpdateTimes.removeAll()
+        // Don't clear capturedFrames - they're already limited to 50
+
+        print("🧹 Cleared mesh data, continuing scan...")
+        sendMeshUpdate()
     }
 
     private func throttledSendUpdate() {
@@ -410,7 +565,8 @@ public class ARKitMeshScannerView: UIView {
                 meshModelEntities[anchor.identifier] = modelEntity
             }
         } catch {
-            // Silently ignore mesh generation failures
+            // Log mesh generation failures for debugging
+            print("⚠️ Mesh generation failed for anchor \(anchor.identifier): \(error.localizedDescription)")
         }
     }
 }
