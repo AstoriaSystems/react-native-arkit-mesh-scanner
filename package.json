@@ -1,6 +1,6 @@
 {
   "name": "react-native-arkit-mesh-scanner",
-  "version": "1.2.0",
+  "version": "1.0.0",
   "description": "A React Native library for 3D mesh scanning using ARKit and LiDAR on iOS devices",
   "main": "src/index.tsx",
   "module": "src/index.tsx",

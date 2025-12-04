@@ -126,6 +126,9 @@ export default function App() {
 
   return (
     <View style={styles.container}>
+      {/* Version label */}
+      <Text style={styles.versionLabel}>v1.0.5</Text>
+
       <ARKitMeshScanner
         ref={scannerRef}
         style={StyleSheet.absoluteFill}
@@ -368,5 +371,13 @@ const styles = StyleSheet.create({
   },
   newScanButton: {
     backgroundColor: '#FF9500',
+  },
+  versionLabel: {
+    position: 'absolute',
+    bottom: 16,
+    right: 16,
+    color: 'rgba(255,255,255,0.4)',
+    fontSize: 12,
+    zIndex: 1000,
   },
 });
