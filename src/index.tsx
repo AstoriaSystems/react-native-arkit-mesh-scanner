@@ -63,6 +63,23 @@ export interface ErrorEvent {
   };
 }
 
+export interface MemoryWarningEvent {
+  nativeEvent: {
+    /** Warning level: 'warning' = approaching limit, 'saved' = chunk auto-saved, 'critical' = must stop */
+    level: 'warning' | 'saved' | 'critical';
+    /** Current memory usage in MB (for 'warning' level) */
+    memoryMB?: number;
+    /** Index of saved chunk (for 'saved' level) */
+    chunkIndex?: number;
+    /** Path to saved chunk file (for 'saved' level) */
+    chunkPath?: string;
+    /** Total number of saved chunks (for 'saved' level) */
+    totalChunks?: number;
+    /** Error message (for 'critical' level when save failed) */
+    error?: string;
+  };
+}
+
 /** Mesh quality levels for export */
 export type MeshQuality = 'low' | 'medium' | 'high' | 'full';
 
@@ -84,6 +101,8 @@ export interface ARKitMeshScannerProps {
   onScanComplete?: (result: ExportResult) => void;
   /** Callback on errors */
   onError?: (error: string) => void;
+  /** Callback on memory warnings (for large scans) */
+  onMemoryWarning?: (event: MemoryWarningEvent['nativeEvent']) => void;
 }
 
 export interface ARKitMeshScannerRef {
@@ -132,6 +151,7 @@ export const ARKitMeshScanner = forwardRef<
       onMeshUpdate,
       onScanComplete,
       onError,
+      onMemoryWarning,
     },
     ref
   ) => {
@@ -219,6 +239,13 @@ export const ARKitMeshScanner = forwardRef<
       [onError]
     );
 
+    const handleMemoryWarning = useCallback(
+      (event: MemoryWarningEvent) => {
+        onMemoryWarning?.(event.nativeEvent);
+      },
+      [onMemoryWarning]
+    );
+
     if (Platform.OS !== 'ios' || !NativeARKitMeshScanner) {
       console.warn('ARKitMeshScanner is only available on iOS with LiDAR');
       return null;
@@ -236,6 +263,7 @@ export const ARKitMeshScanner = forwardRef<
         onMeshUpdate={handleMeshUpdate}
         onScanComplete={handleScanComplete}
         onError={handleError}
+        onMemoryWarning={handleMemoryWarning}
       />
     );
   }
