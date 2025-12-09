@@ -70,6 +70,16 @@ public class ARKitMeshScannerView: UIView {
     private var lastMeshUpdateTimes: [UUID: Date] = [:]
     private let minMeshUpdateInterval: TimeInterval = 0.1 // Update same anchor up to 10x/second
 
+    // RAM protection - limit anchors in memory for visualization
+    private let maxAnchorsInMemory: Int = 150
+    private var anchorAddOrder: [UUID] = []
+
+    // Track which anchors have been "frozen" (evicted from RAM but kept in scene)
+    private var frozenAnchorIds: Set<UUID> = []
+
+    // Disk storage for complete export (separate from RAM-limited visualization)
+    private let diskMeshStorage = DiskMeshStorage()
+
     // Frame capture
     private var capturedFrames: [CapturedFrame] = []
     private var lastCaptureTime: Date = Date()
@@ -173,7 +183,10 @@ public class ARKitMeshScannerView: UIView {
 
         clearMeshEntities()
         meshAnchors.removeAll()
+        anchorAddOrder.removeAll()
+        frozenAnchorIds.removeAll()
         capturedFrames.removeAll()
+        diskMeshStorage.clear()
 
         let configuration = ARWorldTrackingConfiguration()
         configuration.sceneReconstruction = .meshWithClassification
@@ -200,7 +213,9 @@ public class ARKitMeshScannerView: UIView {
     }
 
     @objc public func enterPreviewMode() {
-        guard !meshAnchors.isEmpty else { return }
+        // Check if we have any mesh data (from disk storage)
+        let stats = diskMeshStorage.getStats()
+        guard stats.anchorCount > 0 else { return }
 
         isScanning = false
 
@@ -209,12 +224,26 @@ public class ARKitMeshScannerView: UIView {
             anchorEntity.isEnabled = false
         }
 
-        previewController.enterPreviewMode(
-            arView: arView,
-            meshAnchors: meshAnchors,
-            capturedFrames: capturedFrames,
-            meshColor: meshColorHex
-        )
+        // Load complete mesh data from disk storage
+        diskMeshStorage.loadAllMeshData { [weak self] result in
+            guard let self = self else { return }
+
+            switch result {
+            case .success(let meshData):
+                self.previewController.enterPreviewMode(
+                    arView: self.arView,
+                    vertices: meshData.vertices,
+                    faces: meshData.faces,
+                    meshColor: self.meshColorHex
+                )
+            case .failure(let error):
+                print("Failed to load mesh data for preview: \(error)")
+                // Restore mesh entities visibility on failure
+                for (_, anchorEntity) in self.meshAnchorEntities {
+                    anchorEntity.isEnabled = true
+                }
+            }
+        }
     }
 
     @objc public func exitPreviewMode() {
@@ -233,16 +262,16 @@ public class ARKitMeshScannerView: UIView {
             exitPreviewMode()
         }
         meshAnchors.removeAll()
+        anchorAddOrder.removeAll()
+        frozenAnchorIds.removeAll()
         clearMeshEntities()
+        diskMeshStorage.clear()
         sendMeshUpdate()
     }
 
     @objc public func exportMesh(filename: String, completion: @escaping (String?, Int, Int, String?) -> Void) {
-        meshExporter.exportMesh(
-            meshAnchors: meshAnchors,
-            filename: filename,
-            capturedFrames: capturedFrames
-        ) { result in
+        // Use disk storage for complete export (includes evicted anchors)
+        diskMeshStorage.exportToOBJ(filename: filename) { result in
             switch result {
             case .success(let exportResult):
                 completion(exportResult.path, exportResult.vertexCount, exportResult.faceCount, nil)
@@ -253,18 +282,13 @@ public class ARKitMeshScannerView: UIView {
     }
 
     @objc public func getMeshStats() -> [String: Any] {
-        var totalVertices = 0
-        var totalFaces = 0
-
-        for (_, anchor) in meshAnchors {
-            totalVertices += anchor.geometry.vertices.count
-            totalFaces += anchor.geometry.faces.count
-        }
+        // Use disk stats for accurate totals (includes evicted anchors)
+        let diskStats = diskMeshStorage.getStats()
 
         return [
-            "anchorCount": meshAnchors.count,
-            "vertexCount": totalVertices,
-            "faceCount": totalFaces,
+            "anchorCount": diskStats.anchorCount,
+            "vertexCount": diskStats.vertexCount,
+            "faceCount": diskStats.faceCount,
             "isScanning": isScanning
         ]
     }
@@ -539,12 +563,37 @@ extension ARKitMeshScannerView: ARSessionDelegate {
 
         for anchor in anchors {
             if let meshAnchor = anchor as? ARMeshAnchor {
-                meshAnchors[meshAnchor.identifier] = meshAnchor
-                // Create new meshes immediately
+                let anchorId = meshAnchor.identifier
+
+                // Store to disk for complete export
+                diskMeshStorage.storeAnchor(meshAnchor)
+
+                // RAM: limited visualization
+                meshAnchors[anchorId] = meshAnchor
+                anchorAddOrder.append(anchorId)
+                evictOldAnchorsIfNeeded()
+
+                // Create mesh visualization
                 performMeshEntityUpdate(for: meshAnchor)
             }
         }
         throttledSendUpdate()
+    }
+
+    /// Evict oldest anchors from RAM to prevent overflow
+    /// IMPORTANT: Keep mesh entities in scene for complete visualization!
+    /// Only remove the ARMeshAnchor object (which holds the heavy buffer data)
+    private func evictOldAnchorsIfNeeded() {
+        while meshAnchors.count > maxAnchorsInMemory && !anchorAddOrder.isEmpty {
+            let oldestId = anchorAddOrder.removeFirst()
+            meshAnchors.removeValue(forKey: oldestId)
+            lastMeshUpdateTimes.removeValue(forKey: oldestId)
+            // Mark as frozen - visualization stays, but no more updates
+            frozenAnchorIds.insert(oldestId)
+            // NOTE: We intentionally keep meshAnchorEntities and meshModelEntities!
+            // The visualization stays in the scene even after the anchor data is evicted.
+            // This allows complete visualization while limiting RAM usage.
+        }
     }
 
     public func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
@@ -552,8 +601,20 @@ extension ARKitMeshScannerView: ARSessionDelegate {
 
         for anchor in anchors {
             if let meshAnchor = anchor as? ARMeshAnchor {
-                meshAnchors[meshAnchor.identifier] = meshAnchor
-                updateMeshEntity(for: meshAnchor)
+                let anchorId = meshAnchor.identifier
+
+                // ALWAYS store to disk for complete export (even if evicted from RAM)
+                diskMeshStorage.storeAnchor(meshAnchor)
+
+                // Check if anchor is still in RAM (not evicted)
+                if meshAnchors[anchorId] != nil {
+                    meshAnchors[anchorId] = meshAnchor
+                    updateMeshEntity(for: meshAnchor)
+                } else if frozenAnchorIds.contains(anchorId) {
+                    // Anchor was evicted but entity is still in scene
+                    // Update the visual representation for complete visualization
+                    performMeshEntityUpdate(for: meshAnchor)
+                }
             }
         }
         throttledSendUpdate()
@@ -562,12 +623,16 @@ extension ARKitMeshScannerView: ARSessionDelegate {
     public func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
         for anchor in anchors {
             if let meshAnchor = anchor as? ARMeshAnchor {
-                meshAnchors.removeValue(forKey: meshAnchor.identifier)
+                let anchorId = meshAnchor.identifier
+                meshAnchors.removeValue(forKey: anchorId)
+                frozenAnchorIds.remove(anchorId)
+                anchorAddOrder.removeAll { $0 == anchorId }
+                diskMeshStorage.removeAnchor(anchorId)
 
-                if let anchorEntity = meshAnchorEntities[meshAnchor.identifier] {
+                if let anchorEntity = meshAnchorEntities[anchorId] {
                     arView.scene.removeAnchor(anchorEntity)
-                    meshAnchorEntities.removeValue(forKey: meshAnchor.identifier)
-                    meshModelEntities.removeValue(forKey: meshAnchor.identifier)
+                    meshAnchorEntities.removeValue(forKey: anchorId)
+                    meshModelEntities.removeValue(forKey: anchorId)
                 }
             }
         }

@@ -53,6 +53,11 @@ export interface ExportResult {
   faceCount: number;
 }
 
+export interface MemoryUsage {
+  usedMB: number;
+  usedBytes: number;
+}
+
 export interface MeshUpdateEvent {
   nativeEvent: MeshStats;
 }
@@ -113,6 +118,18 @@ export const isLiDARSupported = async (): Promise<boolean> => {
     return await ARKitMeshScannerModule.isLiDARSupported();
   } catch {
     return false;
+  }
+};
+
+// Get Memory Usage
+export const getMemoryUsage = async (): Promise<MemoryUsage> => {
+  if (Platform.OS !== 'ios') {
+    return { usedMB: 0, usedBytes: 0 };
+  }
+  try {
+    return await ARKitMeshScannerModule.getMemoryUsage();
+  } catch {
+    return { usedMB: 0, usedBytes: 0 };
   }
 };
 

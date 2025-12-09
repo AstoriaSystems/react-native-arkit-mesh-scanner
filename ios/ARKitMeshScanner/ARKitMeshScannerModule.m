@@ -70,6 +70,9 @@ RCT_EXTERN_METHOD(enterPreviewMode:(nonnull NSNumber *)viewTag)
 
 RCT_EXTERN_METHOD(exitPreviewMode:(nonnull NSNumber *)viewTag)
 
+RCT_EXTERN_METHOD(getMemoryUsage:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject)
+
 + (BOOL)requiresMainQueueSetup
 {
     return YES;

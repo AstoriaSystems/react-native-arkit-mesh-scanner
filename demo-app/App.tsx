@@ -23,6 +23,7 @@ import {
   ARKitMeshScanner,
   MeshStats,
   ARKitMeshScannerRef,
+  getMemoryUsage,
 } from 'react-native-arkit-mesh-scanner';
 
 type ViewMode = 'ar' | 'preview';
@@ -33,9 +34,24 @@ export default function App() {
   const [waitingForMesh, setWaitingForMesh] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>('ar');
   const [isExporting, setIsExporting] = useState(false);
+  const [isLoadingPreview, setIsLoadingPreview] = useState(false);
+  const [memoryMB, setMemoryMB] = useState(0);
+  const [lastMemoryMB, setLastMemoryMB] = useState(0);
   const scannerRef = useRef<ARKitMeshScannerRef>(null);
 
   const pulseAnim = useRef(new Animated.Value(1)).current;
+
+  // Memory monitoring
+  useEffect(() => {
+    const updateMemory = async () => {
+      const mem = await getMemoryUsage();
+      setLastMemoryMB(memoryMB);
+      setMemoryMB(mem.usedMB);
+    };
+    updateMemory();
+    const interval = setInterval(updateMemory, 1000);
+    return () => clearInterval(interval);
+  }, [memoryMB]);
 
   useEffect(() => {
     if (waitingForMesh) {
@@ -85,8 +101,12 @@ export default function App() {
   };
 
   const handleEnterPreview = () => {
+    setIsLoadingPreview(true);
     scannerRef.current?.enterPreviewMode();
     setViewMode('preview');
+    // Preview loading completes when the native side finishes
+    // We'll use a timeout as a fallback since we don't have a callback
+    setTimeout(() => setIsLoadingPreview(false), 3000);
   };
 
   const handleExitPreview = () => {
@@ -127,7 +147,7 @@ export default function App() {
   return (
     <View style={styles.container}>
       {/* Version label */}
-      <Text style={styles.versionLabel}>v1.0.5</Text>
+      <Text style={styles.versionLabel}>v1.3.0</Text>
 
       <ARKitMeshScanner
         ref={scannerRef}
@@ -160,6 +180,9 @@ export default function App() {
             </Text>
             <Text style={styles.statsText}>
               Faces: {meshStats?.faceCount?.toLocaleString() ?? 0}
+            </Text>
+            <Text style={[styles.statsText, { marginTop: 8 }]}>
+              RAM: {memoryMB} MB {memoryMB < lastMemoryMB ? '↓' : memoryMB > lastMemoryMB ? '↑' : ''}
             </Text>
           </View>
 
@@ -195,6 +218,18 @@ export default function App() {
       {/* Preview Mode UI */}
       {viewMode === 'preview' && (
         <>
+          {isLoadingPreview && (
+            <View style={styles.loadingOverlay}>
+              <View style={styles.loadingCircle}>
+                <ActivityIndicator size="large" color="#5856D6" />
+              </View>
+              <Text style={styles.loadingText}>Loading 3D Preview...</Text>
+              <Text style={styles.loadingHint}>
+                {meshStats?.vertexCount?.toLocaleString()} vertices
+              </Text>
+            </View>
+          )}
+
           <View style={styles.previewHeader}>
             <Text style={styles.previewTitle}>3D Preview</Text>
             <Text style={styles.previewSubtitle}>Rotate and zoom with gestures</Text>

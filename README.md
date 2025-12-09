@@ -8,6 +8,8 @@ A React Native library for 3D mesh scanning using ARKit and LiDAR on iOS devices
 - Live mesh visualization with customizable colors
 - 3D preview mode with gesture controls (rotate, zoom)
 - Export scanned meshes as OBJ files
+- **Memory-safe disk-based storage** - Scan entire buildings without RAM issues
+- **Thread-safe architecture** - No crashes during scan, visualization, or export
 - Expo and EAS Build support via config plugin
 
 ## Requirements
@@ -141,6 +143,8 @@ function MyScanner() {
     exportMesh,
     getMeshStats,
     clearMesh,
+    enterPreviewMode,
+    exitPreviewMode,
   } = useARKitMeshScanner();
 
   return (
@@ -206,6 +210,25 @@ if (!supported) {
 }
 ```
 
+#### `getMemoryUsage()`
+
+Get current app memory usage. Useful for monitoring during long scans.
+
+```tsx
+import { getMemoryUsage } from 'react-native-arkit-mesh-scanner';
+
+const memory = await getMemoryUsage();
+console.log(`Memory: ${memory.usedMB} MB`);
+```
+
+Returns:
+```typescript
+interface MemoryUsage {
+  usedMB: number;    // Memory usage in megabytes
+  usedBytes: number; // Memory usage in bytes
+}
+```
+
 ### Types
 
 ```typescript
@@ -220,6 +243,11 @@ interface ExportResult {
   path: string;
   vertexCount: number;
   faceCount: number;
+}
+
+interface MemoryUsage {
+  usedMB: number;
+  usedBytes: number;
 }
 
 interface ARKitMeshScannerRef {
@@ -237,22 +265,24 @@ interface ARKitMeshScannerRef {
 
 For large scans, the library includes several optimizations to maintain smooth performance:
 
+### Memory-Safe Disk Storage
+
+Starting with v1.2.0, mesh data is stored on disk instead of RAM, enabling unlimited scan sizes:
+
+- **Per-anchor files**: Each mesh anchor gets its own file on disk
+- **No duplicates**: Updates overwrite existing anchor files (not append)
+- **Thread-safe**: All disk I/O happens on a background queue
+- **Buffer safety**: ARKit buffers are copied via `memcpy` before background processing
+
+This architecture allows scanning entire buildings (1+ hour scans) without memory issues or crashes.
+
+### Visualization Limits
+
+To maintain performance, visualization is limited to ~150 anchors in RAM. The library prioritizes larger anchors and automatically manages what's displayed. All mesh data is preserved on disk regardless of visualization limits.
+
 ### Real-time Rendering
 
-Real-time mesh rendering uses ARKit's native mesh data directly for maximum performance. No decimation is applied during scanning to ensure smooth frame rates.
-
-### Mesh Decimation (Export Only)
-
-When exporting meshes, automatic decimation reduces file size through grid-based vertex clustering:
-
-| Quality | Grid Size | Typical Reduction |
-|---------|-----------|-------------------|
-| `low` | 5cm | ~90% fewer vertices |
-| `medium` | 2.5cm | ~75% fewer vertices |
-| `high` | 1.5cm | ~50% fewer vertices |
-| `full` | None | Original mesh |
-
-Decimation is applied automatically during export to produce smaller OBJ files while preserving mesh quality.
+Real-time mesh rendering uses ARKit's native mesh data directly for maximum performance. Mesh visualization happens BEFORE disk storage to ensure responsive display.
 
 ### Occlusion
 
@@ -273,8 +303,20 @@ The `maxRenderDistance` prop limits how far mesh is rendered. Mesh anchors beyon
 ```tsx
 <ARKitMeshScanner
   enableOcclusion={true}
-  maxRenderDistance={4.0}
+  maxRenderDistance={10.0}  // Increased since v1.2.0 handles large scans well
 />
+```
+
+### Monitoring Memory During Long Scans
+
+```tsx
+import { getMemoryUsage } from 'react-native-arkit-mesh-scanner';
+
+// Check periodically during scanning
+const memory = await getMemoryUsage();
+if (memory.usedMB > 800) {
+  console.warn('Memory usage high:', memory.usedMB, 'MB');
+}
 ```
 
 ## Preview Mode

@@ -75,7 +75,40 @@ final class PreviewController {
 
     // MARK: - Public Methods
 
-    /// Enters preview mode with the given mesh anchors.
+    /// Enters preview mode with pre-loaded mesh data from disk storage.
+    /// This version loads complete mesh data including evicted anchors.
+    func enterPreviewMode(
+        arView: ARView,
+        vertices: [SIMD3<Float>],
+        faces: [[Int]],
+        meshColor: String
+    ) {
+        guard !vertices.isEmpty else { return }
+
+        self.arView = arView
+        isPreviewMode = true
+
+        // Pause AR session
+        arView.session.pause()
+
+        // Dark background for better contrast
+        arView.environment.background = .color(.init(white: 0.05, alpha: 1.0))
+
+        // Reset preview state
+        previewRotation = .zero
+        previewScale = 1.0
+
+        // Add gesture recognizers
+        setupPreviewGestures()
+
+        // Create preview mesh with pre-loaded data
+        createPreviewMeshFromData(vertices: vertices, faces: faces, meshColor: meshColor)
+
+        delegate?.previewControllerDidEnterPreview(self)
+    }
+
+    /// Legacy: Enters preview mode with the given mesh anchors (RAM-limited).
+    @available(*, deprecated, message: "Use enterPreviewMode with vertices/faces from disk storage")
     func enterPreviewMode(
         arView: ARView,
         meshAnchors: [UUID: ARMeshAnchor],
@@ -214,6 +247,100 @@ final class PreviewController {
     }
 
     // MARK: - Mesh Creation with Depth Shading
+
+    /// Create preview mesh from pre-loaded vertex/face data (complete mesh from disk)
+    private func createPreviewMeshFromData(vertices: [SIMD3<Float>], faces: [[Int]], meshColor: String) {
+        guard let arView = arView else { return }
+
+        // Parse color from hex string (from React Native meshColor prop)
+        let previewColor = UIColor(hex: meshColor) ?? UIColor(red: 0.6, green: 0.75, blue: 0.9, alpha: 1.0)
+
+        // Calculate bounding box
+        var minBounds = SIMD3<Float>(Float.infinity, Float.infinity, Float.infinity)
+        var maxBounds = SIMD3<Float>(-Float.infinity, -Float.infinity, -Float.infinity)
+
+        for pos in vertices {
+            minBounds = min(minBounds, pos)
+            maxBounds = max(maxBounds, pos)
+        }
+
+        let center = (minBounds + maxBounds) / 2
+        let size = maxBounds - minBounds
+        let maxDimension = max(size.x, max(size.y, size.z))
+        let normalizedScale: Float = 0.5 / maxDimension
+
+        // Center and scale positions
+        var centeredPositions: [SIMD3<Float>] = []
+        for pos in vertices {
+            centeredPositions.append((pos - center) * normalizedScale)
+        }
+
+        // Convert faces to UInt32 indices
+        var allIndices: [UInt32] = []
+        for face in faces {
+            for index in face {
+                allIndices.append(UInt32(index))
+            }
+        }
+
+        // Create mesh descriptor
+        var descriptor = MeshDescriptor()
+        descriptor.positions = MeshBuffer(centeredPositions)
+        descriptor.primitives = .triangles(allIndices)
+
+        do {
+            let meshResource = try MeshResource.generate(from: [descriptor])
+
+            // Preview material - uses meshColor from React Native props
+            var material = PhysicallyBasedMaterial()
+            material.baseColor = .init(tint: previewColor.withAlphaComponent(0.9))
+            material.roughness = .init(floatLiteral: 0.7)
+            material.metallic = .init(floatLiteral: 0.0)
+            material.blending = .transparent(opacity: .init(floatLiteral: 0.9))
+
+            let modelEntity = ModelEntity(mesh: meshResource, materials: [material])
+
+            // Create anchor at world origin
+            let anchor = AnchorEntity(world: .zero)
+            anchor.addChild(modelEntity)
+
+            // Strong directional light from top-front
+            let mainLight = DirectionalLight()
+            mainLight.light.color = .white
+            mainLight.light.intensity = 8000
+            mainLight.look(at: [0, 0, 0], from: [0.5, 1.5, 1.0], relativeTo: nil)
+            anchor.addChild(mainLight)
+
+            // Fill light from the side
+            let fillLight = DirectionalLight()
+            fillLight.light.color = UIColor(red: 0.8, green: 0.85, blue: 1.0, alpha: 1.0)
+            fillLight.light.intensity = 3000
+            fillLight.look(at: [0, 0, 0], from: [-1.0, 0.5, 0.5], relativeTo: nil)
+            anchor.addChild(fillLight)
+
+            // Rim light from behind
+            let rimLight = DirectionalLight()
+            rimLight.light.color = UIColor(red: 0.9, green: 0.95, blue: 1.0, alpha: 1.0)
+            rimLight.light.intensity = 2000
+            rimLight.look(at: [0, 0, 0], from: [0, 0.5, -1.5], relativeTo: nil)
+            anchor.addChild(rimLight)
+
+            arView.scene.addAnchor(anchor)
+            previewAnchor = anchor
+            previewModel = modelEntity
+
+            // Setup camera
+            setupPreviewCamera()
+
+            // Apply initial transform
+            updatePreviewTransform()
+
+            print("Preview mesh created with \(centeredPositions.count) vertices, \(allIndices.count / 3) triangles (from disk)")
+
+        } catch {
+            print("Failed to create preview mesh from data: \(error)")
+        }
+    }
 
     private func createDepthShadedPreviewMesh(meshAnchors: [UUID: ARMeshAnchor], meshColor: String) {
         guard let arView = arView else { return }
