@@ -169,7 +169,7 @@ Main component for mesh scanning.
 |------|------|---------|-------------|
 | `style` | `ViewStyle` | - | Container style |
 | `showMesh` | `boolean` | `true` | Show mesh overlay during scanning |
-| `meshColor` | `string` | `"#00FFFF"` | Mesh color (used in preview mode) |
+| `meshColor` | `string` | `"#00FFFF"` | Mesh color (used in 3D preview mode) |
 | `enableOcclusion` | `boolean` | `true` | Hide mesh behind walls/objects |
 | `onMeshUpdate` | `(stats: MeshStats) => void` | - | Called when mesh updates |
 | `onScanComplete` | `(result: ExportResult) => void` | - | Called when scan completes |
@@ -263,13 +263,24 @@ interface ARKitMeshScannerRef {
 
 The library uses a memory-safe architecture designed for unlimited scan sizes:
 
-### Zero-Copy Visualization (v1.3.0+)
+### Zero-Copy Visualization (v1.3.2+)
 
 Mesh visualization uses **ARKit's built-in debug wireframe** (`showSceneUnderstanding`). This means:
 
-- **No RAM accumulation**: ARKit manages visualization internally
+- **Zero additional RAM**: ARKit manages visualization internally - no MeshResource or ModelEntity allocations
 - **Unlimited scan duration**: Scan entire buildings without memory issues
 - **Consistent performance**: Memory stays flat regardless of mesh complexity
+- **Optimal tracking**: All CPU resources dedicated to ARKit tracking, not mesh rendering
+
+### Tracking Stability (v1.3.2+)
+
+The library uses optimal ARKit configuration for robust tracking:
+
+- **Smoothed scene depth**: Provides more stable depth data during fast camera movement
+- **HDR video capture** (iOS 16+): Better feature detection in low-light conditions
+- **Auto-focus enabled**: Maintains sharp features for visual tracking
+- **Light estimation**: Adapts to changing lighting conditions
+- **Interruption recovery**: Session interruptions (phone calls, app switches) don't lose mesh data
 
 ### Disk-Based Storage
 
