@@ -49,46 +49,43 @@ import ARKit
 import RealityKit
 
 /// React Native native view for ARKit mesh scanning with LiDAR.
+/// Memory-safe implementation with automatic cleanup and pressure monitoring.
 @objc(ARKitMeshScannerView)
 public class ARKitMeshScannerView: UIView {
 
     // MARK: - Properties
 
     private var arView: ARView!
-    private var meshAnchors: [UUID: ARMeshAnchor] = [:]
-    private var meshAnchorEntities: [UUID: AnchorEntity] = [:]
-    private var meshModelEntities: [UUID: ModelEntity] = [:]
     private var isScanning: Bool = false
     private var lastUpdateTime: Date = Date()
     private let updateInterval: TimeInterval = 0.15
 
-    // Throttling for distance culling
-    private var lastDistanceCheckTime: Date = Date()
-    private let distanceCheckInterval: TimeInterval = 0.5 // Check distance 2x per second
+    // MEMORY-EFFICIENT VISUALIZATION:
+    // Uses ARKit's built-in debug wireframe visualization.
+    // This is extremely memory efficient because ARKit manages the mesh internally.
+    // We only copy mesh data when storing to disk for export.
 
-    // Throttling for mesh updates per anchor
-    private var lastMeshUpdateTimes: [UUID: Date] = [:]
-    private let minMeshUpdateInterval: TimeInterval = 0.1 // Update same anchor up to 10x/second
+    // ARKit debug options for mesh visualization
+    private let meshDebugOptions: ARView.DebugOptions = [.showSceneUnderstanding]
 
-    // RAM protection - limit anchors in memory for visualization
-    private let maxAnchorsInMemory: Int = 150
-    private var anchorAddOrder: [UUID] = []
 
-    // Track which anchors have been "frozen" (evicted from RAM but kept in scene)
-    private var frozenAnchorIds: Set<UUID> = []
+    // Memory pressure monitoring
+    private var lastMemoryCheckTime: Date = Date()
+    private let memoryCheckInterval: TimeInterval = 5.0
+    private var memoryPressureLevel: Int = 0  // 0=normal, 1=warning, 2=critical
 
-    // Disk storage for complete export (separate from RAM-limited visualization)
+    // Memory thresholds (in MB)
+    private let memoryWarningThreshold: UInt64 = 1500
+    private let memoryCriticalThreshold: UInt64 = 2000
+
+    // Disk storage for complete export (ALWAYS stores everything)
     private let diskMeshStorage = DiskMeshStorage()
-
-    // Frame capture
-    private var capturedFrames: [CapturedFrame] = []
-    private var lastCaptureTime: Date = Date()
-    private let captureInterval: TimeInterval = 0.5
-    private let maxFrames: Int = 50
 
     // Controllers
     private let previewController = PreviewController()
-    private let meshExporter = MeshExporter()
+
+    // Memory pressure observer
+    private var memoryWarningObserver: NSObjectProtocol?
 
     // MARK: - Configuration Properties
 
@@ -96,21 +93,19 @@ public class ARKitMeshScannerView: UIView {
         didSet { updateMeshVisibility() }
     }
 
-    @objc public var meshColorHex: String = "#0080FF" {
-        didSet { updateMeshMaterial() }
-    }
+    @objc public var meshColorHex: String = "#0080FF"
 
-    @objc public var wireframe: Bool = false {
-        didSet { updateMeshMaterial() }
-    }
+    @objc public var wireframe: Bool = false
 
     @objc public var enableOcclusion: Bool = true {
         didSet { updateOcclusionSettings() }
     }
 
-    @objc public var maxRenderDistance: Float = 100.0 // meters - effectively disabled
+    // Legacy prop - kept for backwards compatibility but no longer used
+    @objc public var maxRenderDistance: Float = 5.0
 
-    private var currentCameraTransform: simd_float4x4?
+    // Legacy prop - dimming doesn't work well with ARKit debug visualization
+    @objc public var cameraDimming: Float = 0.0
 
     // MARK: - React Native Callbacks
 
@@ -124,12 +119,40 @@ public class ARKitMeshScannerView: UIView {
         super.init(frame: frame)
         setupARView()
         setupPreviewController()
+        setupMemoryPressureMonitoring()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         setupARView()
         setupPreviewController()
+        setupMemoryPressureMonitoring()
+    }
+
+    deinit {
+        // Clean up memory pressure observer
+        if let observer = memoryWarningObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        // Clean up disk storage
+        diskMeshStorage.clear()
+    }
+
+    /// Setup system memory pressure monitoring
+    private func setupMemoryPressureMonitoring() {
+        memoryWarningObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleSystemMemoryWarning()
+        }
+    }
+
+    /// Handle system memory warning
+    private func handleSystemMemoryWarning() {
+        print("⚠️ SYSTEM MEMORY WARNING")
+        memoryPressureLevel = 2
     }
 
     private func setupARView() {
@@ -137,8 +160,13 @@ public class ARKitMeshScannerView: UIView {
         arView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         arView.session.delegate = self
 
-        // Enable occlusion so mesh behind walls is hidden
-        arView.environment.sceneUnderstanding.options = [.occlusion]
+        // Ensure camera feed is visible
+        arView.environment.background = .cameraFeed()
+
+        // Enable occlusion if requested
+        if enableOcclusion {
+            arView.environment.sceneUnderstanding.options = [.occlusion]
+        }
 
         addSubview(arView)
         startCameraPreview()
@@ -181,11 +209,10 @@ public class ARKitMeshScannerView: UIView {
             exitPreviewMode()
         }
 
-        clearMeshEntities()
-        meshAnchors.removeAll()
-        anchorAddOrder.removeAll()
-        frozenAnchorIds.removeAll()
-        capturedFrames.removeAll()
+        // Reset memory pressure state
+        memoryPressureLevel = 0
+
+        // Clear previous data
         diskMeshStorage.clear()
 
         let configuration = ARWorldTrackingConfiguration()
@@ -204,11 +231,18 @@ public class ARKitMeshScannerView: UIView {
         arView.session.run(configuration, options: [.removeExistingAnchors])
         isScanning = true
 
+        // Enable mesh visualization - MEMORY SAFE: only use debug wireframe
+        // NOTE: receivesLighting causes RAM accumulation, so we only use debugOptions
+        if showMesh {
+            arView.debugOptions.insert(.showSceneUnderstanding)
+        }
+
         sendMeshUpdate()
     }
 
     @objc public func stopScanning() {
         isScanning = false
+        // Keep debug visualization visible after stopping
         sendMeshUpdate()
     }
 
@@ -219,12 +253,10 @@ public class ARKitMeshScannerView: UIView {
 
         isScanning = false
 
-        // Hide AR mesh entities
-        for (_, anchorEntity) in meshAnchorEntities {
-            anchorEntity.isEnabled = false
-        }
+        // Hide ARKit's mesh for preview mode (preview has its own background)
+        arView.debugOptions.remove(.showSceneUnderstanding)
 
-        // Load complete mesh data from disk storage
+        // Load complete mesh data from disk storage for preview
         diskMeshStorage.loadAllMeshData { [weak self] result in
             guard let self = self else { return }
 
@@ -238,9 +270,9 @@ public class ARKitMeshScannerView: UIView {
                 )
             case .failure(let error):
                 print("Failed to load mesh data for preview: \(error)")
-                // Restore mesh entities visibility on failure
-                for (_, anchorEntity) in self.meshAnchorEntities {
-                    anchorEntity.isEnabled = true
+                // Restore mesh visualization on failure
+                if self.showMesh {
+                    self.arView.debugOptions.insert(.showSceneUnderstanding)
                 }
             }
         }
@@ -249,9 +281,9 @@ public class ARKitMeshScannerView: UIView {
     @objc public func exitPreviewMode() {
         previewController.exitPreviewMode()
 
-        // Show AR mesh entities again
-        for (_, anchorEntity) in meshAnchorEntities {
-            anchorEntity.isEnabled = true
+        // Restore ARKit's mesh visualization (debug wireframe only - no receivesLighting for memory safety)
+        if showMesh {
+            arView.debugOptions.insert(.showSceneUnderstanding)
         }
 
         startCameraPreview()
@@ -261,11 +293,12 @@ public class ARKitMeshScannerView: UIView {
         if previewController.isActive {
             exitPreviewMode()
         }
-        meshAnchors.removeAll()
-        anchorAddOrder.removeAll()
-        frozenAnchorIds.removeAll()
-        clearMeshEntities()
+
         diskMeshStorage.clear()
+
+        // Reset memory state
+        memoryPressureLevel = 0
+
         sendMeshUpdate()
     }
 
@@ -282,44 +315,68 @@ public class ARKitMeshScannerView: UIView {
     }
 
     @objc public func getMeshStats() -> [String: Any] {
-        // Use disk stats for accurate totals (includes evicted anchors)
+        // Use disk stats for accurate totals
         let diskStats = diskMeshStorage.getStats()
 
         return [
             "anchorCount": diskStats.anchorCount,
             "vertexCount": diskStats.vertexCount,
             "faceCount": diskStats.faceCount,
-            "isScanning": isScanning
+            "isScanning": isScanning,
+            "memoryPressure": memoryPressureLevel
         ]
+    }
+
+    // MARK: - Memory Management Methods
+
+    /// Get current memory usage in MB
+    private func getCurrentMemoryUsage() -> UInt64 {
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: 1) {
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        return result == KERN_SUCCESS ? info.resident_size / (1024 * 1024) : 0
+    }
+
+    /// Check memory pressure and log warnings
+    private func checkMemoryPressure() {
+        let now = Date()
+        guard now.timeIntervalSince(lastMemoryCheckTime) >= memoryCheckInterval else { return }
+        lastMemoryCheckTime = now
+
+        let currentUsage = getCurrentMemoryUsage()
+
+        // Determine pressure level
+        let previousLevel = memoryPressureLevel
+        if currentUsage >= memoryCriticalThreshold {
+            memoryPressureLevel = 2  // Critical
+        } else if currentUsage >= memoryWarningThreshold {
+            memoryPressureLevel = 1  // Warning
+        } else {
+            memoryPressureLevel = 0
+        }
+
+        // Log warnings on level change
+        if memoryPressureLevel >= 2 && previousLevel < 2 {
+            print("⚠️ Memory CRITICAL: \(currentUsage)MB")
+        } else if memoryPressureLevel >= 1 && previousLevel < 1 {
+            print("⚠️ Memory WARNING: \(currentUsage)MB")
+        }
     }
 
     // MARK: - Private Methods
 
-    private func clearMeshEntities() {
-        for (_, anchorEntity) in meshAnchorEntities {
-            arView.scene.removeAnchor(anchorEntity)
-        }
-        meshAnchorEntities.removeAll()
-        meshModelEntities.removeAll()
-    }
-
+    /// Update mesh visibility using ARKit's debug options
+    /// MEMORY SAFE: Only uses debugOptions, no receivesLighting (causes RAM accumulation)
     private func updateMeshVisibility() {
-        for (_, entity) in meshModelEntities {
-            entity.isEnabled = showMesh
+        if showMesh && isScanning {
+            arView.debugOptions.insert(.showSceneUnderstanding)
+        } else {
+            arView.debugOptions.remove(.showSceneUnderstanding)
         }
-    }
-
-    private func updateMeshMaterial() {
-        let color = UIColor(hex: meshColorHex) ?? UIColor(red: 0, green: 0.7, blue: 1, alpha: 1)
-        for (_, entity) in meshModelEntities {
-            applyMaterial(to: entity, color: color)
-        }
-    }
-
-    private func applyMaterial(to entity: ModelEntity, color: UIColor) {
-        var material = UnlitMaterial(color: color.withAlphaComponent(0.9))
-        material.blending = .transparent(opacity: 0.9)
-        entity.model?.materials = [material]
     }
 
     private func sendMeshUpdate() {
@@ -339,282 +396,39 @@ public class ARKitMeshScannerView: UIView {
         }
     }
 
-    /// Update mesh entity with per-anchor throttling
-    private func updateMeshEntity(for anchor: ARMeshAnchor) {
-        guard showMesh else { return }
-
-        let anchorId = anchor.identifier
-        let now = Date()
-
-        // Throttle updates per anchor - skip if updated recently
-        if let lastUpdate = lastMeshUpdateTimes[anchorId],
-           now.timeIntervalSince(lastUpdate) < minMeshUpdateInterval {
-            return
-        }
-        lastMeshUpdateTimes[anchorId] = now
-
-        performMeshEntityUpdate(for: anchor)
-    }
-
-    /// High-performance AND thread-safe mesh entity update
-    /// Copies buffer data in one fast memcpy before ARKit can invalidate it
-    private func performMeshEntityUpdate(for anchor: ARMeshAnchor) {
-        let geometry = anchor.geometry
-        let vertices = geometry.vertices
-        let faces = geometry.faces
-
-        let vertexCount = vertices.count
-        let faceCount = faces.count
-        guard vertexCount > 0, faceCount > 0 else { return }
-
-        // Cache all geometry properties BEFORE buffer access
-        let vertexStride = vertices.stride
-        let vertexOffset = vertices.offset
-        let bytesPerIndex = faces.bytesPerIndex
-        let indexCountPerPrimitive = faces.indexCountPerPrimitive
-        let totalIndices = faceCount * indexCountPerPrimitive
-
-        // Calculate required buffer sizes
-        let vertexBufferSize = vertexOffset + (vertexStride * vertexCount)
-        let faceBufferSize = bytesPerIndex * totalIndices
-
-        // THREAD SAFETY: Single fast memcpy of entire buffers before ARKit can invalidate
-        // This is the critical section - must be as fast as possible
-        let vertexDataCopy = UnsafeMutableRawPointer.allocate(byteCount: vertexBufferSize, alignment: 16)
-        let faceDataCopy = UnsafeMutableRawPointer.allocate(byteCount: faceBufferSize, alignment: 16)
-        defer {
-            vertexDataCopy.deallocate()
-            faceDataCopy.deallocate()
-        }
-
-        // Fast bulk copy - this is atomic enough for our purposes
-        memcpy(vertexDataCopy, vertices.buffer.contents(), vertexBufferSize)
-        memcpy(faceDataCopy, faces.buffer.contents(), faceBufferSize)
-
-        // Now safely extract from our copies - ARKit buffer no longer needed
-        var positions = [SIMD3<Float>](repeating: .zero, count: vertexCount)
-        for i in 0..<vertexCount {
-            let ptr = vertexDataCopy.advanced(by: vertexOffset + vertexStride * i)
-            positions[i] = ptr.assumingMemoryBound(to: SIMD3<Float>.self).pointee
-        }
-
-        var indices = [UInt32](repeating: 0, count: totalIndices)
-        if bytesPerIndex == 4 {
-            memcpy(&indices, faceDataCopy, totalIndices * 4)
-        } else {
-            let src = faceDataCopy.assumingMemoryBound(to: UInt16.self)
-            for i in 0..<totalIndices {
-                indices[i] = UInt32(src[i])
-            }
-        }
-
-        // Build mesh descriptor
-        var descriptor = MeshDescriptor()
-        descriptor.positions = MeshBuffer(positions)
-        descriptor.primitives = .triangles(indices)
-
-        do {
-            let meshResource = try MeshResource.generate(from: [descriptor])
-            let color = UIColor(hex: meshColorHex) ?? UIColor(red: 0, green: 0.7, blue: 1, alpha: 1)
-
-            if let existingModel = meshModelEntities[anchor.identifier] {
-                existingModel.model?.mesh = meshResource
-                existingModel.transform = Transform(matrix: anchor.transform)
-            } else {
-                var material = UnlitMaterial(color: color.withAlphaComponent(0.9))
-                material.blending = .transparent(opacity: 0.9)
-                let modelEntity = ModelEntity(mesh: meshResource, materials: [material])
-                modelEntity.transform = Transform(matrix: anchor.transform)
-
-                let anchorEntity = AnchorEntity(world: .zero)
-                anchorEntity.addChild(modelEntity)
-                arView.scene.addAnchor(anchorEntity)
-
-                meshAnchorEntities[anchor.identifier] = anchorEntity
-                meshModelEntities[anchor.identifier] = modelEntity
-            }
-        } catch {
-            // Silently ignore mesh generation failures
-        }
-    }
 }
 
 // MARK: - ARSessionDelegate
+// MEMORY-EFFICIENT: Uses ARKit's built-in visualization, only stores to disk for export
 
 extension ARKitMeshScannerView: ARSessionDelegate {
 
     public func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        // Update camera transform for distance-based culling
-        currentCameraTransform = frame.camera.transform
-
-        // Throttle distance checks (expensive with many anchors)
-        let now = Date()
-        if now.timeIntervalSince(lastDistanceCheckTime) >= distanceCheckInterval {
-            lastDistanceCheckTime = now
-            updateMeshVisibilityByDistance()
-        }
-
-        guard isScanning else { return }
-
-        // Capture frames periodically for texture mapping
-        if now.timeIntervalSince(lastCaptureTime) >= captureInterval {
-            lastCaptureTime = now
-            captureFrame(frame)
-        }
+        // Check memory pressure periodically
+        checkMemoryPressure()
     }
 
-    private func updateMeshVisibilityByDistance() {
-        guard let cameraTransform = currentCameraTransform else { return }
-        let cameraPosition = SIMD3<Float>(
-            cameraTransform.columns.3.x,
-            cameraTransform.columns.3.y,
-            cameraTransform.columns.3.z
-        )
-
-        for (uuid, anchor) in meshAnchors {
-            guard let modelEntity = meshModelEntities[uuid] else { continue }
-
-            let anchorPosition = SIMD3<Float>(
-                anchor.transform.columns.3.x,
-                anchor.transform.columns.3.y,
-                anchor.transform.columns.3.z
-            )
-
-            let distance = simd_distance(cameraPosition, anchorPosition)
-
-            // Hide meshes that are too far away
-            let shouldBeVisible = showMesh && distance <= maxRenderDistance
-            if modelEntity.isEnabled != shouldBeVisible {
-                modelEntity.isEnabled = shouldBeVisible
-            }
-        }
-    }
-
-    private func captureFrame(_ frame: ARFrame) {
-        switch frame.camera.trackingState {
-        case .normal:
-            break
-        default:
-            return
-        }
-        guard capturedFrames.count < maxFrames else { return }
-
-        if let copiedBuffer = copyPixelBuffer(frame.capturedImage) {
-            let capturedFrame = CapturedFrame(
-                image: copiedBuffer,
-                transform: frame.camera.transform,
-                intrinsics: frame.camera.intrinsics,
-                imageSize: CGSize(
-                    width: CVPixelBufferGetWidth(frame.capturedImage),
-                    height: CVPixelBufferGetHeight(frame.capturedImage)
-                ),
-                timestamp: frame.timestamp
-            )
-            capturedFrames.append(capturedFrame)
-            print("Captured frame \(capturedFrames.count)/\(maxFrames)")
-        }
-    }
-
-    private func copyPixelBuffer(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
-        let format = CVPixelBufferGetPixelFormatType(pixelBuffer)
-
-        var newPixelBuffer: CVPixelBuffer?
-        let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, format, nil, &newPixelBuffer)
-
-        guard status == kCVReturnSuccess, let newBuffer = newPixelBuffer else { return nil }
-
-        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-        CVPixelBufferLockBaseAddress(newBuffer, [])
-
-        let srcY = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0)
-        let dstY = CVPixelBufferGetBaseAddressOfPlane(newBuffer, 0)
-        let srcYBytes = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
-        let dstYBytes = CVPixelBufferGetBytesPerRowOfPlane(newBuffer, 0)
-        let heightY = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
-
-        if let srcY = srcY, let dstY = dstY {
-            for row in 0..<heightY {
-                memcpy(dstY.advanced(by: row * dstYBytes), srcY.advanced(by: row * srcYBytes), min(srcYBytes, dstYBytes))
-            }
-        }
-
-        let srcUV = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1)
-        let dstUV = CVPixelBufferGetBaseAddressOfPlane(newBuffer, 1)
-        let srcUVBytes = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1)
-        let dstUVBytes = CVPixelBufferGetBytesPerRowOfPlane(newBuffer, 1)
-        let heightUV = CVPixelBufferGetHeightOfPlane(pixelBuffer, 1)
-
-        if let srcUV = srcUV, let dstUV = dstUV {
-            for row in 0..<heightUV {
-                memcpy(dstUV.advanced(by: row * dstUVBytes), srcUV.advanced(by: row * srcUVBytes), min(srcUVBytes, dstUVBytes))
-            }
-        }
-
-        CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
-        CVPixelBufferUnlockBaseAddress(newBuffer, [])
-
-        return newBuffer
-    }
-
+    /// Handle new mesh anchors: store to disk only (ARKit handles visualization via debugOptions)
     public func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
         guard isScanning else { return }
 
         for anchor in anchors {
             if let meshAnchor = anchor as? ARMeshAnchor {
-                let anchorId = meshAnchor.identifier
-
-                // Store to disk for complete export
+                // Store to disk for export - ARKit's debugOptions handles visualization
                 diskMeshStorage.storeAnchor(meshAnchor)
-
-                // RAM: limited visualization
-                meshAnchors[anchorId] = meshAnchor
-                anchorAddOrder.append(anchorId)
-                evictOldAnchorsIfNeeded()
-
-                // Create mesh visualization
-                performMeshEntityUpdate(for: meshAnchor)
             }
         }
         throttledSendUpdate()
     }
 
-    /// Evict oldest anchors from RAM to prevent overflow
-    /// IMPORTANT: Keep mesh entities in scene for complete visualization!
-    /// Only remove the ARMeshAnchor object (which holds the heavy buffer data)
-    private func evictOldAnchorsIfNeeded() {
-        while meshAnchors.count > maxAnchorsInMemory && !anchorAddOrder.isEmpty {
-            let oldestId = anchorAddOrder.removeFirst()
-            meshAnchors.removeValue(forKey: oldestId)
-            lastMeshUpdateTimes.removeValue(forKey: oldestId)
-            // Mark as frozen - visualization stays, but no more updates
-            frozenAnchorIds.insert(oldestId)
-            // NOTE: We intentionally keep meshAnchorEntities and meshModelEntities!
-            // The visualization stays in the scene even after the anchor data is evicted.
-            // This allows complete visualization while limiting RAM usage.
-        }
-    }
-
+    /// Handle updated mesh anchors: update disk storage only
     public func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
         guard isScanning else { return }
 
         for anchor in anchors {
             if let meshAnchor = anchor as? ARMeshAnchor {
-                let anchorId = meshAnchor.identifier
-
-                // ALWAYS store to disk for complete export (even if evicted from RAM)
+                // Update disk storage - ARKit's debugOptions handles visualization
                 diskMeshStorage.storeAnchor(meshAnchor)
-
-                // Check if anchor is still in RAM (not evicted)
-                if meshAnchors[anchorId] != nil {
-                    meshAnchors[anchorId] = meshAnchor
-                    updateMeshEntity(for: meshAnchor)
-                } else if frozenAnchorIds.contains(anchorId) {
-                    // Anchor was evicted but entity is still in scene
-                    // Update the visual representation for complete visualization
-                    performMeshEntityUpdate(for: meshAnchor)
-                }
             }
         }
         throttledSendUpdate()
@@ -623,17 +437,8 @@ extension ARKitMeshScannerView: ARSessionDelegate {
     public func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
         for anchor in anchors {
             if let meshAnchor = anchor as? ARMeshAnchor {
-                let anchorId = meshAnchor.identifier
-                meshAnchors.removeValue(forKey: anchorId)
-                frozenAnchorIds.remove(anchorId)
-                anchorAddOrder.removeAll { $0 == anchorId }
-                diskMeshStorage.removeAnchor(anchorId)
-
-                if let anchorEntity = meshAnchorEntities[anchorId] {
-                    arView.scene.removeAnchor(anchorEntity)
-                    meshAnchorEntities.removeValue(forKey: anchorId)
-                    meshModelEntities.removeValue(forKey: anchorId)
-                }
+                // Remove from disk storage - ARKit handles removing visualization
+                diskMeshStorage.removeAnchor(meshAnchor.identifier)
             }
         }
         sendMeshUpdate()

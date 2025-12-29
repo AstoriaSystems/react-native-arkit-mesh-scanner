@@ -169,10 +169,8 @@ Main component for mesh scanning.
 |------|------|---------|-------------|
 | `style` | `ViewStyle` | - | Container style |
 | `showMesh` | `boolean` | `true` | Show mesh overlay during scanning |
-| `meshColor` | `string` | `"#00FFFF"` | Mesh color as hex string |
-| `wireframe` | `boolean` | `false` | Show mesh as wireframe |
+| `meshColor` | `string` | `"#00FFFF"` | Mesh color (used in preview mode) |
 | `enableOcclusion` | `boolean` | `true` | Hide mesh behind walls/objects |
-| `maxRenderDistance` | `number` | `5.0` | Max distance in meters to render mesh |
 | `onMeshUpdate` | `(stats: MeshStats) => void` | - | Called when mesh updates |
 | `onScanComplete` | `(result: ExportResult) => void` | - | Called when scan completes |
 | `onError` | `(error: string) => void` | - | Called on errors |
@@ -261,62 +259,49 @@ interface ARKitMeshScannerRef {
 }
 ```
 
-## Performance Optimization
+## Architecture
 
-For large scans, the library includes several optimizations to maintain smooth performance:
+The library uses a memory-safe architecture designed for unlimited scan sizes:
 
-### Memory-Safe Disk Storage
+### Zero-Copy Visualization (v1.3.0+)
 
-Starting with v1.2.0, mesh data is stored on disk instead of RAM, enabling unlimited scan sizes:
+Mesh visualization uses **ARKit's built-in debug wireframe** (`showSceneUnderstanding`). This means:
+
+- **No RAM accumulation**: ARKit manages visualization internally
+- **Unlimited scan duration**: Scan entire buildings without memory issues
+- **Consistent performance**: Memory stays flat regardless of mesh complexity
+
+### Disk-Based Storage
+
+All mesh data is streamed directly to disk for export:
 
 - **Per-anchor files**: Each mesh anchor gets its own file on disk
-- **No duplicates**: Updates overwrite existing anchor files (not append)
-- **Thread-safe**: All disk I/O happens on a background queue
-- **Buffer safety**: ARKit buffers are copied via `memcpy` before background processing
+- **No duplicates**: Updates overwrite existing anchor files
+- **Thread-safe**: All disk I/O happens on a background queue with NSLock protection
+- **Buffer safety**: ARKit buffers are copied via `memcpy` BEFORE async dispatch
 
-This architecture allows scanning entire buildings (1+ hour scans) without memory issues or crashes.
+This architecture allows 1+ hour scans without crashes or memory warnings.
 
-### Visualization Limits
+### Thread Safety
 
-To maintain performance, visualization is limited to ~150 anchors in RAM. The library prioritizes larger anchors and automatically manages what's displayed. All mesh data is preserved on disk regardless of visualization limits.
+The library is fully thread-safe:
 
-### Real-time Rendering
-
-Real-time mesh rendering uses ARKit's native mesh data directly for maximum performance. Mesh visualization happens BEFORE disk storage to ensure responsive display.
+- **Synchronous buffer copy**: Mesh data copied on main thread before ARKit can invalidate
+- **Background writes**: Disk I/O on dedicated serial queue
+- **Protected metadata**: NSLock guards all shared state
+- **Pending write tracking**: Ensures all writes complete before export
 
 ### Occlusion
 
 When `enableOcclusion` is true (default), mesh behind walls and objects is automatically hidden, preventing visual confusion when moving between rooms.
 
-### Distance Culling
-
-The `maxRenderDistance` prop limits how far mesh is rendered. Mesh anchors beyond this distance are hidden, improving performance in large environments.
-
-```tsx
-<ARKitMeshScanner
-  maxRenderDistance={3.0}  // Only show mesh within 3 meters
-/>
-```
-
-### Recommended Settings for Large Scans
-
-```tsx
-<ARKitMeshScanner
-  enableOcclusion={true}
-  maxRenderDistance={10.0}  // Increased since v1.2.0 handles large scans well
-/>
-```
-
-### Monitoring Memory During Long Scans
+### Monitoring Memory
 
 ```tsx
 import { getMemoryUsage } from 'react-native-arkit-mesh-scanner';
 
-// Check periodically during scanning
 const memory = await getMemoryUsage();
-if (memory.usedMB > 800) {
-  console.warn('Memory usage high:', memory.usedMB, 'MB');
-}
+console.log(`Memory: ${memory.usedMB} MB`);
 ```
 
 ## Preview Mode
