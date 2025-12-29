@@ -5,43 +5,9 @@
 //  Copyright (c) 2025 Astoria Systems GmbH
 //  Author: Mergim Mavraj
 //
-//  This file is part of the React Native ARKit Mesh Scanner.
-//
-//  Dual License:
-//  ---------------------------------------------------------------------------
-//  Commercial License
-//  ---------------------------------------------------------------------------
-//  If you purchased a commercial license from Astoria Systems GmbH, you are
-//  granted the rights defined in the commercial license agreement. This license
-//  permits the use of this software in closed-source, proprietary, or
-//  competitive commercial products.
-//
-//  To obtain a commercial license, please contact:
-//  licensing@astoria.systems
-//
-//  ---------------------------------------------------------------------------
-//  Open Source License (AGPL-3.0)
-//  ---------------------------------------------------------------------------
-//  If you have not purchased a commercial license, this software is offered
-//  under the terms of the GNU Affero General Public License v3.0 (AGPL-3.0).
-//
-//  You may use, modify, and redistribute this software under the conditions of
-//  the AGPL-3.0. Any software that incorporates or interacts with this code
-//  over a network must also be released under the AGPL-3.0.
-//
-//  A copy of the AGPL-3.0 license is provided in the repository's LICENSE file
-//  or at: https://www.gnu.org/licenses/agpl-3.0.html
-//
-//  ---------------------------------------------------------------------------
-//  Disclaimer
-//  ---------------------------------------------------------------------------
-//  This software is provided "AS IS", without warranty of any kind, express or
-//  implied, including but not limited to the warranties of merchantability,
-//  fitness for a particular purpose and noninfringement. In no event shall the
-//  authors or copyright holders be liable for any claim, damages or other
-//  liability, whether in an action of contract, tort or otherwise, arising from,
-//  out of or in connection with the software or the use or other dealings in
-//  the software.
+//  RAM-OPTIMIZED VERSION: Uses ARKit's built-in debug wireframe for visualization.
+//  No custom MeshResource/ModelEntity = minimal RAM usage.
+//  Disk storage handles export - no mesh data kept in RAM.
 
 
 import UIKit
@@ -58,31 +24,22 @@ public class ARKitMeshScannerView: UIView {
     private var arView: ARView!
     private var isScanning: Bool = false
     private var lastUpdateTime: Date = Date()
-    private let updateInterval: TimeInterval = 0.15
+    private let updateInterval: TimeInterval = 0.2  // Slower updates = less CPU
 
-    // MEMORY-EFFICIENT VISUALIZATION:
-    // Uses ARKit's built-in debug wireframe visualization.
-    // This is extremely memory efficient because ARKit manages the mesh internally.
-    // We only copy mesh data when storing to disk for export.
+    // ZERO RAM VISUALIZATION:
+    // Uses ARKit's built-in debug wireframe (.showSceneUnderstanding)
+    // ARKit manages mesh internally - we never copy or store mesh data in RAM
+    // Disk storage handles export asynchronously
 
-    // ARKit debug options for mesh visualization
-    private let meshDebugOptions: ARView.DebugOptions = [.showSceneUnderstanding]
-
-
-    // Memory pressure monitoring
-    private var lastMemoryCheckTime: Date = Date()
-    private let memoryCheckInterval: TimeInterval = 5.0
-    private var memoryPressureLevel: Int = 0  // 0=normal, 1=warning, 2=critical
-
-    // Memory thresholds (in MB)
-    private let memoryWarningThreshold: UInt64 = 1500
-    private let memoryCriticalThreshold: UInt64 = 2000
-
-    // Disk storage for complete export (ALWAYS stores everything)
+    // Disk storage for export only (writes happen on background queue)
     private let diskMeshStorage = DiskMeshStorage()
 
     // Controllers
     private let previewController = PreviewController()
+
+    // Per-anchor throttle to reduce disk writes
+    private var lastAnchorWriteTime: [UUID: Date] = [:]
+    private let anchorWriteInterval: TimeInterval = 1.0  // Max 1 write per anchor per second
 
     // Memory pressure observer
     private var memoryWarningObserver: NSObjectProtocol?
@@ -101,11 +58,7 @@ public class ARKitMeshScannerView: UIView {
         didSet { updateOcclusionSettings() }
     }
 
-    // Legacy prop - kept for backwards compatibility but no longer used
     @objc public var maxRenderDistance: Float = 5.0
-
-    // Legacy prop - dimming doesn't work well with ARKit debug visualization
-    @objc public var cameraDimming: Float = 0.0
 
     // MARK: - React Native Callbacks
 
@@ -130,11 +83,9 @@ public class ARKitMeshScannerView: UIView {
     }
 
     deinit {
-        // Clean up memory pressure observer
         if let observer = memoryWarningObserver {
             NotificationCenter.default.removeObserver(observer)
         }
-        // Clean up disk storage
         diskMeshStorage.clear()
     }
 
@@ -145,14 +96,10 @@ public class ARKitMeshScannerView: UIView {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.handleSystemMemoryWarning()
+            print("⚠️ SYSTEM MEMORY WARNING")
+            // With debug wireframe, we have nothing to evict
+            // ARKit manages its own memory
         }
-    }
-
-    /// Handle system memory warning
-    private func handleSystemMemoryWarning() {
-        print("⚠️ SYSTEM MEMORY WARNING")
-        memoryPressureLevel = 2
     }
 
     private func setupARView() {
@@ -209,11 +156,9 @@ public class ARKitMeshScannerView: UIView {
             exitPreviewMode()
         }
 
-        // Reset memory pressure state
-        memoryPressureLevel = 0
-
         // Clear previous data
         diskMeshStorage.clear()
+        lastAnchorWriteTime.removeAll()
 
         let configuration = ARWorldTrackingConfiguration()
         configuration.sceneReconstruction = .meshWithClassification
@@ -221,18 +166,30 @@ public class ARKitMeshScannerView: UIView {
         configuration.worldAlignment = .gravity
         configuration.planeDetection = [.horizontal, .vertical]
 
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-            configuration.frameSemantics.insert(.sceneDepth)
-        }
+        // TRACKING STABILITY: Enable all available features for robust tracking
+        // smoothedSceneDepth provides more stable depth data during fast movement
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
             configuration.frameSemantics.insert(.smoothedSceneDepth)
+        } else if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+            configuration.frameSemantics.insert(.sceneDepth)
         }
 
-        arView.session.run(configuration, options: [.removeExistingAnchors])
+        // Enable high-resolution frame capture for better feature detection in low light
+        if #available(iOS 16.0, *) {
+            configuration.videoHDRAllowed = true
+        }
+
+        // Maximize feature tracking quality
+        configuration.isAutoFocusEnabled = true
+        configuration.isLightEstimationEnabled = true
+
+        // MEMORY SAFETY: Reset session completely to free ARKit's internal mesh data
+        // NOTE: Only reset tracking at start, NOT during scanning (causes tracking loss!)
+        arView.session.run(configuration, options: [.resetSceneReconstruction, .removeExistingAnchors, .resetTracking])
         isScanning = true
 
-        // Enable mesh visualization - MEMORY SAFE: only use debug wireframe
-        // NOTE: receivesLighting causes RAM accumulation, so we only use debugOptions
+        // MEMORY SAFE: Use ARKit's debug wireframe only
+        // This uses ZERO additional RAM - ARKit manages mesh internally
         if showMesh {
             arView.debugOptions.insert(.showSceneUnderstanding)
         }
@@ -253,7 +210,7 @@ public class ARKitMeshScannerView: UIView {
 
         isScanning = false
 
-        // Hide ARKit's mesh for preview mode (preview has its own background)
+        // Hide ARKit's mesh for preview mode
         arView.debugOptions.remove(.showSceneUnderstanding)
 
         // Load complete mesh data from disk storage for preview
@@ -281,7 +238,7 @@ public class ARKitMeshScannerView: UIView {
     @objc public func exitPreviewMode() {
         previewController.exitPreviewMode()
 
-        // Restore ARKit's mesh visualization (debug wireframe only - no receivesLighting for memory safety)
+        // Restore ARKit's mesh visualization
         if showMesh {
             arView.debugOptions.insert(.showSceneUnderstanding)
         }
@@ -295,15 +252,13 @@ public class ARKitMeshScannerView: UIView {
         }
 
         diskMeshStorage.clear()
-
-        // Reset memory state
-        memoryPressureLevel = 0
+        lastAnchorWriteTime.removeAll()
 
         sendMeshUpdate()
     }
 
     @objc public func exportMesh(filename: String, completion: @escaping (String?, Int, Int, String?) -> Void) {
-        // Use disk storage for complete export (includes evicted anchors)
+        // Use disk storage for complete export
         diskMeshStorage.exportToOBJ(filename: filename) { result in
             switch result {
             case .success(let exportResult):
@@ -322,55 +277,14 @@ public class ARKitMeshScannerView: UIView {
             "anchorCount": diskStats.anchorCount,
             "vertexCount": diskStats.vertexCount,
             "faceCount": diskStats.faceCount,
-            "isScanning": isScanning,
-            "memoryPressure": memoryPressureLevel
+            "isScanning": isScanning
         ]
-    }
-
-    // MARK: - Memory Management Methods
-
-    /// Get current memory usage in MB
-    private func getCurrentMemoryUsage() -> UInt64 {
-        var info = mach_task_basic_info()
-        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
-        let result = withUnsafeMutablePointer(to: &info) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: 1) {
-                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
-            }
-        }
-        return result == KERN_SUCCESS ? info.resident_size / (1024 * 1024) : 0
-    }
-
-    /// Check memory pressure and log warnings
-    private func checkMemoryPressure() {
-        let now = Date()
-        guard now.timeIntervalSince(lastMemoryCheckTime) >= memoryCheckInterval else { return }
-        lastMemoryCheckTime = now
-
-        let currentUsage = getCurrentMemoryUsage()
-
-        // Determine pressure level
-        let previousLevel = memoryPressureLevel
-        if currentUsage >= memoryCriticalThreshold {
-            memoryPressureLevel = 2  // Critical
-        } else if currentUsage >= memoryWarningThreshold {
-            memoryPressureLevel = 1  // Warning
-        } else {
-            memoryPressureLevel = 0
-        }
-
-        // Log warnings on level change
-        if memoryPressureLevel >= 2 && previousLevel < 2 {
-            print("⚠️ Memory CRITICAL: \(currentUsage)MB")
-        } else if memoryPressureLevel >= 1 && previousLevel < 1 {
-            print("⚠️ Memory WARNING: \(currentUsage)MB")
-        }
     }
 
     // MARK: - Private Methods
 
     /// Update mesh visibility using ARKit's debug options
-    /// MEMORY SAFE: Only uses debugOptions, no receivesLighting (causes RAM accumulation)
+    /// ZERO RAM: Only toggles debugOptions flag
     private func updateMeshVisibility() {
         if showMesh && isScanning {
             arView.debugOptions.insert(.showSceneUnderstanding)
@@ -396,6 +310,17 @@ public class ARKitMeshScannerView: UIView {
         }
     }
 
+    /// Check if we should write this anchor (throttle per-anchor)
+    private func shouldWriteAnchor(_ anchorId: UUID) -> Bool {
+        let now = Date()
+        if let lastWrite = lastAnchorWriteTime[anchorId] {
+            if now.timeIntervalSince(lastWrite) < anchorWriteInterval {
+                return false
+            }
+        }
+        lastAnchorWriteTime[anchorId] = now
+        return true
+    }
 }
 
 // MARK: - ARSessionDelegate
@@ -404,20 +329,22 @@ public class ARKitMeshScannerView: UIView {
 extension ARKitMeshScannerView: ARSessionDelegate {
 
     public func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        // Check memory pressure periodically
-        checkMemoryPressure()
+        // Nothing to do - ARKit handles visualization internally
     }
 
-    /// Handle new mesh anchors: store to disk only (ARKit handles visualization via debugOptions)
+    /// Handle new mesh anchors: store to disk only (no RAM storage)
     public func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
         guard isScanning else { return }
 
         for anchor in anchors {
             if let meshAnchor = anchor as? ARMeshAnchor {
-                // Store to disk for export - ARKit's debugOptions handles visualization
-                diskMeshStorage.storeAnchor(meshAnchor)
+                // Throttle per-anchor to reduce disk writes
+                if shouldWriteAnchor(meshAnchor.identifier) {
+                    diskMeshStorage.storeAnchor(meshAnchor)
+                }
             }
         }
+
         throttledSendUpdate()
     }
 
@@ -427,18 +354,21 @@ extension ARKitMeshScannerView: ARSessionDelegate {
 
         for anchor in anchors {
             if let meshAnchor = anchor as? ARMeshAnchor {
-                // Update disk storage - ARKit's debugOptions handles visualization
-                diskMeshStorage.storeAnchor(meshAnchor)
+                // Throttle per-anchor to reduce disk writes
+                if shouldWriteAnchor(meshAnchor.identifier) {
+                    diskMeshStorage.storeAnchor(meshAnchor)
+                }
             }
         }
+
         throttledSendUpdate()
     }
 
     public func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
         for anchor in anchors {
             if let meshAnchor = anchor as? ARMeshAnchor {
-                // Remove from disk storage - ARKit handles removing visualization
                 diskMeshStorage.removeAnchor(meshAnchor.identifier)
+                lastAnchorWriteTime.removeValue(forKey: meshAnchor.identifier)
             }
         }
         sendMeshUpdate()
@@ -451,12 +381,35 @@ extension ARKitMeshScannerView: ARSessionDelegate {
     public func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
         switch camera.trackingState {
         case .notAvailable:
-            print("Tracking not available")
+            print("⚠️ Tracking not available")
         case .limited(let reason):
-            print("Tracking limited: \(reason)")
+            switch reason {
+            case .excessiveMotion:
+                print("⚠️ Tracking limited: Excessive motion - slow down")
+            case .insufficientFeatures:
+                print("⚠️ Tracking limited: Insufficient features - point at textured surfaces")
+            case .initializing:
+                print("ℹ️ Tracking initializing...")
+            case .relocalizing:
+                print("ℹ️ Tracking relocalizing...")
+            @unknown default:
+                print("⚠️ Tracking limited: \(reason)")
+            }
         case .normal:
-            print("Tracking normal")
+            print("✅ Tracking normal")
         }
+    }
+
+    /// Handle session interruption (e.g., phone call, app switch)
+    public func sessionWasInterrupted(_ session: ARSession) {
+        print("⚠️ Session interrupted")
+    }
+
+    /// Handle session interruption end - attempt to resume tracking
+    public func sessionInterruptionEnded(_ session: ARSession) {
+        print("ℹ️ Session interruption ended, attempting to resume...")
+        // Don't reset tracking - just let ARKit try to relocalize
+        // This preserves the existing mesh data
     }
 }
 

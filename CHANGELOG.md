@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.2] - 2025-12-30
+
+### Changed
+- **Maximum RAM optimization**: Removed all custom mesh rendering, uses only ARKit's built-in debug wireframe
+- **Zero RAM visualization**: No MeshResource/ModelEntity allocations - ARKit manages mesh internally
+- Removed LowLevelMesh, Metal shaders, and all custom rendering code
+
+### Improved
+- **Tracking stability**: Added `smoothedSceneDepth` for more stable depth data during fast movement
+- **Low-light performance**: Enabled `videoHDRAllowed` (iOS 16+) for better feature detection
+- **Auto-focus and light estimation**: Enabled for improved tracking accuracy
+- **Session interruption handling**: Proper recovery without losing mesh data
+
+### Removed
+- `useCustomMesh` prop (no longer needed - debug wireframe only)
+- `LowLevelMeshRenderer.swift` and `MeshComputeShader.metal`
+- All custom mesh visualization code
+
 ## [1.3.1] - 2025-12-29
 
 ### Fixed

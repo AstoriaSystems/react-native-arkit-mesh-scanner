@@ -107,6 +107,7 @@ final class PreviewController {
         delegate?.previewControllerDidEnterPreview(self)
     }
 
+
     /// Exits preview mode and restores the AR view.
     func exitPreviewMode() {
         guard let arView = arView else { return }
@@ -216,59 +217,38 @@ final class PreviewController {
 
     // MARK: - Mesh Creation with Depth Shading
 
-    /// MEMORY-SAFE: Create preview mesh from pre-loaded vertex/face data
-    /// Uses autoreleasepool and processes in chunks to prevent memory spikes
+    /// Create preview mesh from pre-loaded vertex/face data (complete mesh from disk)
     private func createPreviewMeshFromData(vertices: [SIMD3<Float>], faces: [[Int]], meshColor: String) {
         guard let arView = arView else { return }
 
         // Parse color from hex string (from React Native meshColor prop)
         let previewColor = UIColor(hex: meshColor) ?? UIColor(red: 0.6, green: 0.75, blue: 0.9, alpha: 1.0)
 
-        // MEMORY SAFETY: Process bounds calculation in chunks
+        // Calculate bounding box
         var minBounds = SIMD3<Float>(Float.infinity, Float.infinity, Float.infinity)
         var maxBounds = SIMD3<Float>(-Float.infinity, -Float.infinity, -Float.infinity)
 
-        let chunkSize = 10000
-        for chunkStart in stride(from: 0, to: vertices.count, by: chunkSize) {
-            autoreleasepool {
-                let chunkEnd = min(chunkStart + chunkSize, vertices.count)
-                for i in chunkStart..<chunkEnd {
-                    let pos = vertices[i]
-                    minBounds = min(minBounds, pos)
-                    maxBounds = max(maxBounds, pos)
-                }
-            }
+        for pos in vertices {
+            minBounds = min(minBounds, pos)
+            maxBounds = max(maxBounds, pos)
         }
 
         let center = (minBounds + maxBounds) / 2
         let size = maxBounds - minBounds
         let maxDimension = max(size.x, max(size.y, size.z))
-        let normalizedScale: Float = maxDimension > 0 ? 0.5 / maxDimension : 1.0
+        let normalizedScale: Float = 0.5 / maxDimension
 
-        // MEMORY-SAFE: Center and scale positions in-place style
+        // Center and scale positions
         var centeredPositions: [SIMD3<Float>] = []
-        centeredPositions.reserveCapacity(vertices.count)
-
-        for chunkStart in stride(from: 0, to: vertices.count, by: chunkSize) {
-            autoreleasepool {
-                let chunkEnd = min(chunkStart + chunkSize, vertices.count)
-                for i in chunkStart..<chunkEnd {
-                    centeredPositions.append((vertices[i] - center) * normalizedScale)
-                }
-            }
+        for pos in vertices {
+            centeredPositions.append((pos - center) * normalizedScale)
         }
 
-        // MEMORY-SAFE: Convert faces to UInt32 indices with size limit
+        // Convert faces to UInt32 indices
         var allIndices: [UInt32] = []
-        let maxIndices = min(faces.count * 3, 3_000_000)  // Limit to 1M triangles
-        allIndices.reserveCapacity(maxIndices)
-
         for face in faces {
-            if allIndices.count >= maxIndices { break }
             for index in face {
-                if index >= 0 && index < centeredPositions.count {
-                    allIndices.append(UInt32(index))
-                }
+                allIndices.append(UInt32(index))
             }
         }
 

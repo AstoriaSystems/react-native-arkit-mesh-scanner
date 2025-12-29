@@ -51,8 +51,7 @@ import Foundation
 import ARKit
 
 /// Stores mesh data on disk with one file per anchor.
-/// 100% THREAD-SAFE and memory-efficient for huge scans.
-/// CRITICAL: Never loses scan data - disk storage is always active.
+/// Thread-safe and memory-efficient for huge scans.
 final class DiskMeshStorage {
 
     private let storageDir: URL
@@ -61,14 +60,6 @@ final class DiskMeshStorage {
     // Track anchor metadata (small - stays in RAM)
     private var anchorMetadata: [UUID: AnchorMeta] = [:]
     private let metadataLock = NSLock()
-
-    // Track which anchors have pending writes to avoid duplicate allocations
-    private var pendingAnchorWrites: Set<UUID> = []
-    private let pendingWritesLock = NSLock()
-
-    // Throttle updates per anchor - only store if enough time has passed
-    private var lastAnchorUpdateTime: [UUID: Date] = [:]
-    private let anchorUpdateInterval: TimeInterval = 1.0  // Minimum 1 second between updates per anchor
 
     // Flag to skip writes after clear (atomic for thread safety)
     private var isCleared: Bool = false
@@ -82,65 +73,27 @@ final class DiskMeshStorage {
     init() {
         let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         storageDir = cacheDir.appendingPathComponent("mesh_anchors_\(UUID().uuidString)")
-
-        // Ensure directory exists
-        do {
-            try FileManager.default.createDirectory(at: storageDir, withIntermediateDirectories: true)
-        } catch {
-            print("⚠️ Failed to create mesh storage directory: \(error)")
-        }
+        try? FileManager.default.createDirectory(at: storageDir, withIntermediateDirectories: true)
     }
 
     /// Store anchor data to disk. Replaces existing file for same anchor (no duplicates).
-    /// 100% THREAD-SAFE: Copies buffer data synchronously before ARKit can invalidate.
-    /// MEMORY-SAFE: Throttles updates and skips pending writes to prevent RAM buildup.
+    /// CRITICAL: Copy buffer data BEFORE calling this from ARKit delegate.
     func storeAnchor(_ anchor: ARMeshAnchor) {
-        let anchorId = anchor.identifier
-        let now = Date()
-
-        // MEMORY SAFETY: Throttle updates per anchor (max once per second)
-        // This drastically reduces buffer allocations during active scanning
-        metadataLock.lock()
-        if let lastUpdate = lastAnchorUpdateTime[anchorId] {
-            if now.timeIntervalSince(lastUpdate) < anchorUpdateInterval {
-                metadataLock.unlock()
-                return  // Skip - updated too recently
-            }
-        }
-        lastAnchorUpdateTime[anchorId] = now
-        metadataLock.unlock()
-
-        // MEMORY SAFETY: Skip if this anchor already has a pending write
-        // This prevents RAM from filling up with queued buffer copies
-        pendingWritesLock.lock()
-        if pendingAnchorWrites.contains(anchorId) {
-            pendingWritesLock.unlock()
-            return  // Skip - previous version still being written
-        }
-        pendingAnchorWrites.insert(anchorId)
-        pendingWritesLock.unlock()
-
         let geometry = anchor.geometry
         let vertices = geometry.vertices
         let faces = geometry.faces
         let vertexCount = vertices.count
         let faceCount = faces.count
+        let anchorId = anchor.identifier
         let transform = anchor.transform
 
-        guard vertexCount > 0 else {
-            // Remove from pending if no data
-            pendingWritesLock.lock()
-            pendingAnchorWrites.remove(anchorId)
-            pendingWritesLock.unlock()
-            return
-        }
+        guard vertexCount > 0 else { return }
 
-        // THREAD SAFETY: Cache all geometry properties BEFORE buffer access
+        // Copy buffers on main thread BEFORE ARKit invalidates them
         let vertexStride = vertices.stride
         let vertexOffset = vertices.offset
         let vertexBufferSize = vertexOffset + (vertexStride * vertexCount)
 
-        // CRITICAL: Allocate and copy in one atomic operation
         let vertexDataCopy = UnsafeMutableRawPointer.allocate(byteCount: vertexBufferSize, alignment: 16)
         memcpy(vertexDataCopy, vertices.buffer.contents(), vertexBufferSize)
 
@@ -156,16 +109,11 @@ final class DiskMeshStorage {
             memcpy(faceDataCopy!, faces.buffer.contents(), faceBufferSize)
         }
 
-        // Write to disk on background queue - data is now safely copied
+        // Write to disk on background queue
         writeQueue.async { [weak self] in
             defer {
                 vertexDataCopy.deallocate()
                 faceDataCopy?.deallocate()
-
-                // Remove from pending set so next update can be processed
-                self?.pendingWritesLock.lock()
-                self?.pendingAnchorWrites.remove(anchorId)
-                self?.pendingWritesLock.unlock()
             }
 
             // Skip if storage was cleared while write was queued
@@ -186,7 +134,6 @@ final class DiskMeshStorage {
         }
     }
 
-    /// MEMORY-SAFE: Stream write to disk without building huge strings in RAM
     private func writeAnchorToDisk(
         anchorId: UUID,
         transform: simd_float4x4,
@@ -202,73 +149,38 @@ final class DiskMeshStorage {
         autoreleasepool {
             let filePath = storageDir.appendingPathComponent("\(anchorId.uuidString).mesh")
 
-            // Create file and get handle for streaming writes
-            FileManager.default.createFile(atPath: filePath.path, contents: nil)
-            guard let fileHandle = FileHandle(forWritingAtPath: filePath.path) else {
-                print("Failed to create file handle for \(filePath)")
-                return
-            }
+            // Build OBJ content for this anchor
+            var content = ""
+            content.reserveCapacity(vertexCount * 40 + faceCount * 30)
 
-            defer {
-                try? fileHandle.close()
-            }
-
-            // STREAMING WRITE: Write vertices in chunks to avoid memory spikes
-            let chunkSize = 500  // Process 500 vertices at a time
-            var vertexChunk = ""
-            vertexChunk.reserveCapacity(chunkSize * 45)
-
+            // Write vertices
             for i in 0..<vertexCount {
-                autoreleasepool {
-                    let ptr = vertexDataCopy.advanced(by: vertexOffset + vertexStride * i)
-                    let vertex = ptr.assumingMemoryBound(to: SIMD3<Float>.self).pointee
-                    let worldVertex = transform * SIMD4<Float>(vertex.x, vertex.y, vertex.z, 1.0)
-                    vertexChunk += "v \(worldVertex.x) \(worldVertex.y) \(worldVertex.z)\n"
-
-                    // Flush chunk to disk periodically
-                    if (i + 1) % chunkSize == 0 || i == vertexCount - 1 {
-                        if let data = vertexChunk.data(using: .utf8) {
-                            try? fileHandle.write(contentsOf: data)
-                        }
-                        vertexChunk = ""
-                        vertexChunk.reserveCapacity(chunkSize * 45)
-                    }
-                }
+                let ptr = vertexDataCopy.advanced(by: vertexOffset + vertexStride * i)
+                let vertex = ptr.assumingMemoryBound(to: SIMD3<Float>.self).pointee
+                let worldVertex = transform * SIMD4<Float>(vertex.x, vertex.y, vertex.z, 1.0)
+                content += "v \(worldVertex.x) \(worldVertex.y) \(worldVertex.z)\n"
             }
 
-            // STREAMING WRITE: Write faces in chunks
+            // Write faces (local indices, will be adjusted at export)
             if faceCount > 0, let faceData = faceDataCopy {
-                var faceChunk = ""
-                faceChunk.reserveCapacity(chunkSize * 30)
-
                 for i in 0..<faceCount {
-                    autoreleasepool {
-                        var indices = [Int]()
-                        indices.reserveCapacity(indexCountPerPrimitive)
-
-                        for j in 0..<indexCountPerPrimitive {
-                            let offset = bytesPerIndex * (i * indexCountPerPrimitive + j)
-                            let index: Int
-                            if bytesPerIndex == 4 {
-                                index = Int(faceData.advanced(by: offset).assumingMemoryBound(to: UInt32.self).pointee)
-                            } else {
-                                index = Int(faceData.advanced(by: offset).assumingMemoryBound(to: UInt16.self).pointee)
-                            }
-                            indices.append(index + 1) // OBJ is 1-indexed (local to this anchor)
+                    var indices = [Int]()
+                    for j in 0..<indexCountPerPrimitive {
+                        let offset = bytesPerIndex * (i * indexCountPerPrimitive + j)
+                        let index: Int
+                        if bytesPerIndex == 4 {
+                            index = Int(faceData.advanced(by: offset).assumingMemoryBound(to: UInt32.self).pointee)
+                        } else {
+                            index = Int(faceData.advanced(by: offset).assumingMemoryBound(to: UInt16.self).pointee)
                         }
-                        faceChunk += "f \(indices.map { String($0) }.joined(separator: " "))\n"
-
-                        // Flush chunk to disk periodically
-                        if (i + 1) % chunkSize == 0 || i == faceCount - 1 {
-                            if let data = faceChunk.data(using: .utf8) {
-                                try? fileHandle.write(contentsOf: data)
-                            }
-                            faceChunk = ""
-                            faceChunk.reserveCapacity(chunkSize * 30)
-                        }
+                        indices.append(index + 1) // OBJ is 1-indexed (local to this anchor)
                     }
+                    content += "f \(indices.map { String($0) }.joined(separator: " "))\n"
                 }
             }
+
+            // Write to file (overwrites existing - no duplicates!)
+            try? content.write(to: filePath, atomically: true, encoding: .utf8)
 
             // Update metadata
             metadataLock.lock()
@@ -392,8 +304,8 @@ final class DiskMeshStorage {
         }
     }
 
-    /// MEMORY-SAFE: Load mesh data for preview
-    /// Limits to subset of anchors if data is too large
+    /// Load all mesh data for preview (vertices and faces as arrays)
+    /// Returns nil if no data or error
     func loadAllMeshData(completion: @escaping (Result<(vertices: [SIMD3<Float>], faces: [[Int]]), Error>) -> Void) {
         writeQueue.async { [weak self] in
             guard let self = self else {
@@ -402,9 +314,7 @@ final class DiskMeshStorage {
             }
 
             self.metadataLock.lock()
-            // Sort by SMALLEST first to get better spatial coverage (many small anchors = more area)
-            var anchors = Array(self.anchorMetadata.values).sorted { $0.vertexCount < $1.vertexCount }
-            let totalVertexCount = self.anchorMetadata.values.reduce(0) { $0 + $1.vertexCount }
+            let anchors = Array(self.anchorMetadata.values).sorted { $0.filePath.lastPathComponent < $1.filePath.lastPathComponent }
             self.metadataLock.unlock()
 
             guard !anchors.isEmpty else {
@@ -412,69 +322,45 @@ final class DiskMeshStorage {
                 return
             }
 
-            // MEMORY SAFETY: Limit vertices for preview to prevent RAM spike
-            // 500K vertices = ~6MB vertex data + ~4MB face indices = ~10MB total (safe for preview)
-            let maxPreviewVertices = 500_000
-            var selectedAnchors: [AnchorMeta] = []
-            var currentVertexCount = 0
-
-            // If total is under limit, use all anchors
-            if totalVertexCount <= maxPreviewVertices {
-                selectedAnchors = anchors
-                currentVertexCount = totalVertexCount
-            } else {
-                // Take anchors until we hit the limit
-                for anchor in anchors {
-                    if currentVertexCount + anchor.vertexCount <= maxPreviewVertices {
-                        selectedAnchors.append(anchor)
-                        currentVertexCount += anchor.vertexCount
-                    }
-                }
-            }
-
-            print("Loading preview: \(selectedAnchors.count)/\(anchors.count) anchors, \(currentVertexCount)/\(totalVertexCount) vertices")
-
             var allVertices: [SIMD3<Float>] = []
             var allFaces: [[Int]] = []
             var globalVertexOffset = 0
 
-            allVertices.reserveCapacity(currentVertexCount)
-
-            for meta in selectedAnchors {
+            for meta in anchors {
                 autoreleasepool {
-                    guard let content = try? String(contentsOf: meta.filePath, encoding: .utf8) else { return }
+                    if let content = try? String(contentsOf: meta.filePath, encoding: .utf8) {
+                        let lines = content.components(separatedBy: "\n")
+                        var localVertexCount = 0
 
-                    var localVertices: [SIMD3<Float>] = []
-                    var localFaces: [[Int]] = []
-
-                    let lines = content.components(separatedBy: "\n")
-
-                    for line in lines {
-                        if line.hasPrefix("v ") {
-                            let parts = line.dropFirst(2).split(separator: " ")
-                            if parts.count >= 3,
-                               let x = Float(parts[0]),
-                               let y = Float(parts[1]),
-                               let z = Float(parts[2]) {
-                                localVertices.append(SIMD3<Float>(x, y, z))
-                            }
-                        } else if line.hasPrefix("f ") {
-                            let parts = line.dropFirst(2).split(separator: " ")
-                            let indices = parts.compactMap { Int($0) }.map { ($0 - 1) + globalVertexOffset }
-                            if indices.count >= 3 {
-                                localFaces.append(indices)
+                        // Parse vertices
+                        for line in lines {
+                            if line.hasPrefix("v ") {
+                                let parts = line.dropFirst(2).split(separator: " ")
+                                if parts.count >= 3,
+                                   let x = Float(parts[0]),
+                                   let y = Float(parts[1]),
+                                   let z = Float(parts[2]) {
+                                    allVertices.append(SIMD3<Float>(x, y, z))
+                                    localVertexCount += 1
+                                }
                             }
                         }
-                    }
 
-                    // Append local data to global arrays
-                    allVertices.append(contentsOf: localVertices)
-                    allFaces.append(contentsOf: localFaces)
-                    globalVertexOffset += localVertices.count
+                        // Parse faces with offset adjustment
+                        for line in lines {
+                            if line.hasPrefix("f ") {
+                                let parts = line.dropFirst(2).split(separator: " ")
+                                let indices = parts.compactMap { Int($0) }.map { $0 - 1 + globalVertexOffset } // Convert to 0-indexed with offset
+                                if indices.count >= 3 {
+                                    allFaces.append(indices)
+                                }
+                            }
+                        }
+
+                        globalVertexOffset += localVertexCount
+                    }
                 }
             }
-
-            print("Preview loaded: \(allVertices.count) vertices, \(allFaces.count) faces")
 
             DispatchQueue.main.async {
                 completion(.success((allVertices, allFaces)))
@@ -483,56 +369,26 @@ final class DiskMeshStorage {
     }
 
     /// Clear all stored data - thread safe
-    /// Waits for all pending writes to complete before clearing
     func clear() {
         // Set flag first to stop accepting new writes
         isCleared = true
 
-        // Clear pending writes set
-        pendingWritesLock.lock()
-        pendingAnchorWrites.removeAll()
-        pendingWritesLock.unlock()
-
-        // Clear metadata and throttle times
+        // Clear metadata
         metadataLock.lock()
         anchorMetadata.removeAll()
-        lastAnchorUpdateTime.removeAll()
         metadataLock.unlock()
 
-        // Queue cleanup
+        // Queue cleanup after all pending writes complete
         writeQueue.async { [weak self] in
             guard let self = self else { return }
-
-            // Now safe to delete
             try? FileManager.default.removeItem(at: self.storageDir)
             try? FileManager.default.createDirectory(at: self.storageDir, withIntermediateDirectories: true)
-
             // Reset flag after cleanup so new scans can start
             self.isCleared = false
         }
     }
 
-    /// Get number of pending disk writes
-    func getPendingWriteCount() -> Int {
-        pendingWritesLock.lock()
-        let count = pendingAnchorWrites.count
-        pendingWritesLock.unlock()
-        return count
-    }
-
-    /// Wait for all pending writes to complete (blocking)
-    func waitForPendingWrites(timeout: TimeInterval = 5.0) {
-        let startTime = Date()
-        while Date().timeIntervalSince(startTime) < timeout {
-            if getPendingWriteCount() == 0 { return }
-            Thread.sleep(forTimeInterval: 0.05)
-        }
-        print("⚠️ DiskMeshStorage: Timeout waiting for pending writes")
-    }
-
     deinit {
-        // Wait for pending writes before cleanup
-        waitForPendingWrites(timeout: 2.0)
         try? FileManager.default.removeItem(at: storageDir)
     }
 }

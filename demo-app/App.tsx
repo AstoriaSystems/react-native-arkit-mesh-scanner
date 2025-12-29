@@ -147,14 +147,12 @@ export default function App() {
   return (
     <View style={styles.container}>
       {/* Version label */}
-      <Text style={styles.versionLabel}>v1.3.0</Text>
+      <Text style={styles.versionLabel}>v1.3.2</Text>
 
       <ARKitMeshScanner
         ref={scannerRef}
         style={StyleSheet.absoluteFill}
         showMesh={true}
-        meshColor="#2D2B83"
-        wireframe={false}
         onMeshUpdate={handleMeshUpdate}
       />
 
